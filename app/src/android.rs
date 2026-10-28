@@ -1,7 +1,7 @@
 //! Android glue: JNI calls into the framework for things NativeActivity lacks.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use winit::platform::android::activity::AndroidApp;
 use jni::objects::{GlobalRef, JObject, JString, JValue};
@@ -9,6 +9,8 @@ use jni::{JNIEnv, JavaVM};
 
 static APP: OnceLock<AndroidApp> = OnceLock::new();
 static MULTICAST_LOCK: OnceLock<GlobalRef> = OnceLock::new();
+/// CPU wake lock and Wi-Fi lock, held only while the receiver runs.
+static RECEIVE_LOCKS: Mutex<Vec<GlobalRef>> = Mutex::new(Vec::new());
 
 pub fn init(app: AndroidApp) {
     let _ = APP.set(app);
@@ -119,6 +121,72 @@ pub fn acquire_multicast_lock() {
             .l()?;
         env.call_method(&lock, "acquire", "()V", &[])?;
         let _ = MULTICAST_LOCK.set(env.new_global_ref(lock)?);
+        Ok(())
+    });
+}
+
+fn system_service<'a>(env: &mut JNIEnv<'a>, context: &JObject<'_>, name: &str) -> jni::errors::Result<JObject<'a>> {
+    let name = env.new_string(name)?;
+    env.call_method(
+        context,
+        "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        &[JValue::Object(&name)],
+    )?
+    .l()
+}
+
+/// Keeps the CPU and Wi-Fi radio awake so transfers survive the screen locking.
+/// Without this the device sleeps shortly after lock and incoming connections stall or time out.
+pub fn set_keep_awake(on: bool) {
+    let mut held = RECEIVE_LOCKS.lock().unwrap();
+    if !on {
+        for lock in held.drain(..) {
+            with_env(|env, _| {
+                if env.call_method(&lock, "isHeld", "()Z", &[])?.z()? {
+                    env.call_method(&lock, "release", "()V", &[])?;
+                }
+                Ok(())
+            });
+        }
+        return;
+    }
+    if !held.is_empty() {
+        return;
+    }
+    with_env(|env, activity| {
+        let context = env
+            .call_method(activity, "getApplicationContext", "()Landroid/content/Context;", &[])?
+            .l()?;
+        let power = system_service(env, &context, "power")?;
+        let tag = env.new_string("airlynx:receive")?;
+        // PARTIAL_WAKE_LOCK = 1
+        let wake = env
+            .call_method(
+                &power,
+                "newWakeLock",
+                "(ILjava/lang/String;)Landroid/os/PowerManager$WakeLock;",
+                &[JValue::Int(1), JValue::Object(&tag)],
+            )?
+            .l()?;
+        env.call_method(&wake, "setReferenceCounted", "(Z)V", &[JValue::Bool(0)])?;
+        env.call_method(&wake, "acquire", "()V", &[])?;
+        held.push(env.new_global_ref(wake)?);
+
+        let wifi = system_service(env, &context, "wifi")?;
+        let tag = env.new_string("airlynx")?;
+        // WIFI_MODE_FULL_HIGH_PERF = 3 (deprecated since API 34 but still honored)
+        let wifi_lock = env
+            .call_method(
+                &wifi,
+                "createWifiLock",
+                "(ILjava/lang/String;)Landroid/net/wifi/WifiManager$WifiLock;",
+                &[JValue::Int(3), JValue::Object(&tag)],
+            )?
+            .l()?;
+        env.call_method(&wifi_lock, "setReferenceCounted", "(Z)V", &[JValue::Bool(0)])?;
+        env.call_method(&wifi_lock, "acquire", "()V", &[])?;
+        held.push(env.new_global_ref(wifi_lock)?);
         Ok(())
     });
 }

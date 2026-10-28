@@ -22,6 +22,9 @@ mod desktop {
             .join("AirLynx")
     }
 
+    /// Android only: holds wake/Wi-Fi locks so receiving works with the screen locked.
+    pub fn set_keep_awake(_on: bool) {}
+
     pub fn pick_files() -> Vec<PathBuf> {
         rfd::FileDialog::new().pick_files().unwrap_or_default()
     }

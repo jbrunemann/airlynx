@@ -48,6 +48,9 @@ name = "android.permission.ACCESS_WIFI_STATE"
 name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
 
 [[package.metadata.android.uses_permission]]
+name = "android.permission.WAKE_LOCK"
+
+[[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
 [package.metadata.android.application]

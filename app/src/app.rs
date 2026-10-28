@@ -198,6 +198,7 @@ impl AirLynxApp {
         match result {
             Ok(handle) => {
                 self.receiver = Some(handle);
+                platform::set_keep_awake(true);
                 self.receiver_error = None;
             }
             Err(e) => self.receiver_error = Some(format!("Could not start receiver: {e}")),
@@ -352,6 +353,7 @@ impl AirLynxApp {
             if ui.button("Stop receiving").clicked() {
                 // Dropping the handle stops the listener.
                 self.receiver = None;
+                platform::set_keep_awake(false);
             }
         } else {
             ui.label("Not receiving.");

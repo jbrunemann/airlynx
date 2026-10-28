@@ -137,6 +137,9 @@ $ADB logcat | grep -i airlynx
   resize, though, so the keyboard covers anything below the focused field.
 - **JNI calls** go through `android::with_env`, which attaches the thread and logs and clears Java exceptions.
   The `AndroidApp` is stored in a `OnceLock` by `android::init`.
+- **Receiving with the screen locked:** `android::set_keep_awake` holds a partial wake lock and a Wi-Fi lock while the
+  receiver runs (`WAKE_LOCK` permission). This is not a foreground service, because cargo-apk can't ship a Java `Service`,
+  so Android may still freeze or kill the backgrounded process. Not verified on a device yet.
 - **Edition 2024** requires `#[unsafe(no_mangle)]` on `android_main`.
 
 ---
@@ -156,7 +159,8 @@ Rough priority order:
 4. **Security:** there is no encryption and no authentication, and any device on the LAN can push files.
    Ideas: a pairing code or accept prompt on the receiver, and TLS with pinned self-signed certs.
 5. **Receiver UX:** an accept/decline prompt, a cancel button for incoming transfers, persisted history,
-   and a notification on Android.
+   and a notification on Android. A real foreground service (with a notification) is the robust fix for
+   receiving while locked or backgrounded; it needs the Gradle/Java move from item 3.
 6. **Packaging:** app icons (both platforms), a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.
 7. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
    and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
