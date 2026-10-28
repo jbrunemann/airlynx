@@ -1,0 +1,64 @@
+[package]
+name = "airlynx-app"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "airlynx-app"
+path = "src/main.rs"
+
+[dependencies]
+airlynx-core = { path = "../core" }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+dirs = "7.0.0"
+gethostname = "1.1.0"
+rfd = "0.17.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15.1"
+eframe = { version = "0.37.0", default-features = false, features = ["android-native-activity"] }
+jni = "0.21"
+log = "0.4.34"
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+
+[package.metadata.android]
+package = "dev.airlynx.app"
+apk_name = "AirLynx"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 30
+target_sdk_version = 34
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+[package.metadata.android.application]
+label = "AirLynx"
+
+[package.metadata.android.application.activity]
+exported = true
+# Keep the NativeActivity alive across rotation/keyboard changes instead of restarting it.
+config_changes = "orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
+orientation = "portrait"
+
+[package.metadata.android.signing.release]
+path = "../android-debug.keystore"
+keystore_password = "android"
