@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig, ReceiverHandle};
 use airlynx_core::send::{self, Entry, Progress, Report};
-use airlynx_core::{DEFAULT_TCP_PORT, DeviceId, Favorites, Identity, Peer, Profile, discover, human_size};
+use airlynx_core::{DEFAULT_TCP_PORT, DeviceId, DeviceKind, Favorites, Identity, Peer, Profile, discover, human_size};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::platform;
@@ -110,7 +110,7 @@ impl Shared {
 #[derive(Default)]
 struct Actions {
     send_to: Option<(SocketAddr, String)>,
-    add_favorite: Option<(DeviceId, String)>,
+    add_favorite: Option<(DeviceId, String, DeviceKind)>,
     remove_favorite: Option<DeviceId>,
     dismiss_request: Option<DeviceId>,
     scan: bool,
@@ -157,7 +157,7 @@ impl AirLynxApp {
         let mut app = Self {
             shared: Arc::default(),
             cancel: Arc::default(),
-            identity: Identity::new(profile.id, &device_name),
+            identity: Identity::new(profile.id, &device_name).with_kind(platform::device_kind()),
             favorites: profile.favorites,
             notice,
             tab: Tab::default(),
@@ -211,9 +211,9 @@ impl AirLynxApp {
                 Ok(found) => {
                     let now = Instant::now();
                     for peer in found {
-                        // Keep stored favorite names current if the other device was renamed.
+                        // Keep stored favorite names and kinds current.
                         if favorites.contains(peer.id) {
-                            let _ = favorites.add(peer.id, &peer.name);
+                            let _ = favorites.add(peer.id, &peer.name, peer.kind);
                         }
                         s.peers.retain(|p| p.peer.id != peer.id);
                         s.peers.push(SeenPeer { peer, seen: now });
@@ -338,8 +338,8 @@ impl AirLynxApp {
         if let Some((addr, name)) = actions.send_to {
             self.start_send(ctx, addr, name);
         }
-        if let Some((id, name)) = actions.add_favorite {
-            self.set_notice(self.favorites.add(id, &name));
+        if let Some((id, name, kind)) = actions.add_favorite {
+            self.set_notice(self.favorites.add(id, &name, kind));
             self.shared.lock().unwrap().requests.retain(|r| r.id != id);
         }
         if let Some(id) = actions.remove_favorite {
@@ -429,6 +429,7 @@ impl AirLynxApp {
         for fav in &favorites {
             let live = s.online(fav.id);
             ui.horizontal(|ui| {
+                device_icon(ui, live.map_or(fav.kind, |p| p.kind));
                 ui.label(RichText::new(&fav.name).strong());
                 ui.label(RichText::new(fav.id.short()).weak().small());
             });
@@ -477,7 +478,7 @@ impl AirLynxApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Add favorite").clicked() {
-                    actions.add_favorite = Some((peer.id, peer.name.clone()));
+                    actions.add_favorite = Some((peer.id, peer.name.clone(), peer.kind));
                 }
                 if peer.mutual {
                     ui.label(RichText::new("has added you").weak());
@@ -549,7 +550,7 @@ impl AirLynxApp {
             ui.label(format!("{} tried to send you files, but is not a favorite.", req.name));
             ui.horizontal(|ui| {
                 if ui.button("Add favorite").clicked() {
-                    actions.add_favorite = Some((req.id, req.name.clone()));
+                    actions.add_favorite = Some((req.id, req.name.clone(), DeviceKind::Unknown));
                 }
                 if ui.button("Dismiss").clicked() {
                     actions.dismiss_request = Some(req.id);
@@ -633,6 +634,33 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
             }
         }
     }
+}
+
+/// A small monitor or phone outline, drawn with shapes so it needs no font or image.
+fn device_icon(ui: &mut egui::Ui, kind: DeviceKind) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    let stroke = egui::Stroke::new(1.5, ui.visuals().text_color());
+    let p = ui.painter();
+    let at = |x: f32, y: f32| rect.min + egui::vec2(x, y);
+    match kind {
+        DeviceKind::Desktop => {
+            p.rect_stroke(egui::Rect::from_min_max(at(1.0, 2.5), at(17.0, 12.5)), 2.0, stroke, egui::StrokeKind::Inside);
+            p.line_segment([at(9.0, 12.5), at(9.0, 15.5)], stroke);
+            p.line_segment([at(5.5, 15.5), at(12.5, 15.5)], stroke);
+        }
+        DeviceKind::Mobile => {
+            p.rect_stroke(egui::Rect::from_min_max(at(4.5, 1.0), at(13.5, 17.0)), 2.5, stroke, egui::StrokeKind::Inside);
+            p.line_segment([at(8.0, 14.0), at(10.0, 14.0)], stroke);
+        }
+        DeviceKind::Unknown => {
+            p.circle_stroke(rect.center(), 7.0, stroke);
+        }
+    }
+    response.on_hover_text(match kind {
+        DeviceKind::Desktop => "Computer",
+        DeviceKind::Mobile => "Mobile device",
+        DeviceKind::Unknown => "Unknown device type",
+    });
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {

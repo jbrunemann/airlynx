@@ -80,14 +80,16 @@ The app rescans every 6 s, and a device stays "online" for 20 s after its last a
 
 Identity and favorites are stored in `<config dir>/AirLynx` on desktop (`~/Library/Application Support/AirLynx`
 on macOS) and in the app's private `files/config` on Android, as `device-id` and `favorites` text files.
+A `favorites` line is `<id> kind:<desktop|mobile|unknown> <name>`; older lines without `kind:` still load.
 
 ---
 
-## Protocol (version 2)
+## Protocol (version 3)
 
 **Discovery** on UDP 47801. A device broadcasts `AIRLYNX_DISCOVER <id>` to `255.255.255.255` twice, where
 `<id>` is its 32-hex-digit device id. Every other running device replies
-`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <name>` to the asker's address. `mutual` is 1 when the replier has
+`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <kind d|m|?> <name>` to the asker's address. `kind` is `d` for a
+computer, `m` for a mobile device, `?` if unknown (shown as an icon next to favorites). `mutual` is 1 when the replier has
 the asker as a favorite. The asker drops replies carrying its own id and de-duplicates by id.
 
 **Transfer** on TCP 47800 (default). There is one connection per send session, and all integers are big-endian:

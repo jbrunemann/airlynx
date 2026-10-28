@@ -278,7 +278,7 @@ mod tests {
         assert!(sanitize_name("dir/").is_err());
     }
 
-    use crate::identity::DeviceId;
+    use crate::identity::{DeviceId, DeviceKind};
     use crate::send::{self, Entry};
     use std::net::TcpListener;
     use std::ops::ControlFlow;
@@ -316,7 +316,7 @@ mod tests {
     fn favorite_can_send() {
         let me = Identity::new(DeviceId::random(), "Phone");
         let favorites = Favorites::in_memory();
-        favorites.add(me.id, "Phone").unwrap();
+        favorites.add(me.id, "Phone", DeviceKind::Unknown).unwrap();
         let (result, events) = loopback(&favorites, &me);
         assert_eq!(result.unwrap().sent, ["hello.txt"]);
         assert!(events.iter().any(|e| matches!(e, ReceiveEvent::FileSaved { .. })));

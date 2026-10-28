@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig};
-use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, Identity, Peer, Profile, discover, human_size, send};
+use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, DeviceKind, Identity, Peer, Profile, discover, human_size, send};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -95,11 +95,12 @@ fn run(cli: Cli) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("no config directory; pass --config-dir"))?;
     let profile = Profile::load(&dir)?;
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-    let me = Identity::new(profile.id, hostname.strip_suffix(".local").unwrap_or(&hostname));
+    let me = Identity::new(profile.id, hostname.strip_suffix(".local").unwrap_or(&hostname))
+        .with_kind(DeviceKind::Desktop);
 
     match cli.command {
         Command::Receive { dir, port, name } => {
-            let me = name.map_or(me.clone(), |n| Identity::new(me.id, &n));
+            let me = name.map_or(me.clone(), |n| Identity::new(me.id, &n).with_kind(me.kind));
             run_receive(ReceiverConfig { dir, port, identity: me, favorites: profile.favorites })
         }
         Command::Send { files, device, to, wait } => run_send(&profile, &me, files, device, to, Duration::from_secs(wait)),
@@ -128,13 +129,13 @@ fn run(cli: Cli) -> io::Result<()> {
         Command::Favorite(FavoriteCommand::Add { device, name, wait }) => {
             if let Ok(id) = device.parse::<DeviceId>() {
                 let name = name.unwrap_or_else(|| format!("device {}", id.short()));
-                profile.favorites.add(id, &name)?;
+                profile.favorites.add(id, &name, DeviceKind::Unknown)?;
                 println!("Added \"{name}\" ({}) as a favorite", id.short());
                 return Ok(());
             }
             let peers = discover(&me, Duration::from_secs(wait))?;
             let peer = pick(&peers, &device, |p| (p.id, &p.name))?;
-            profile.favorites.add(peer.id, &peer.name)?;
+            profile.favorites.add(peer.id, &peer.name, peer.kind)?;
             println!("Added \"{}\" ({}) as a favorite", peer.name, peer.id.short());
             if !peer.mutual {
                 println!("They need to add this device too before files can be exchanged.");

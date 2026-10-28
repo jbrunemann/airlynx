@@ -1,5 +1,5 @@
 //! UDP broadcast discovery: devices broadcast "AIRLYNX_DISCOVER <id>" and every
-//! other running device answers "AIRLYNX_HERE <tcp_port> <id> <mutual> <name>".
+//! other running device answers "AIRLYNX_HERE <tcp_port> <id> <mutual> <kind> <name>".
 //! `mutual` is 1 when the answering device has the asker as a favorite.
 
 use std::collections::HashSet;
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::identity::{DeviceId, Favorites, Identity, clean_name};
+use crate::identity::{DeviceId, DeviceKind, Favorites, Identity, clean_name};
 use crate::protocol::{ANNOUNCE_PREFIX, DISCOVER_PREFIX, DISCOVERY_PORT};
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,7 @@ pub struct Peer {
     pub name: String,
     /// The peer has us as a favorite.
     pub mutual: bool,
+    pub kind: DeviceKind,
 }
 
 /// Binds the discovery port. Done separately from `spawn_responder` so bind
@@ -45,7 +46,7 @@ pub(crate) fn spawn_responder(
                 Ok((n, from)) => {
                     let Some(asker) = parse_request(&buf[..n]) else { continue };
                     let mutual = u8::from(favorites.contains(asker));
-                    let reply = format!("{ANNOUNCE_PREFIX} {tcp_port} {} {mutual} {}", me.id, me.name);
+                    let reply = format!("{ANNOUNCE_PREFIX} {tcp_port} {} {mutual} {} {}", me.id, me.kind.code(), me.name);
                     let _ = socket.send_to(reply.as_bytes(), from);
                 }
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
@@ -105,19 +106,21 @@ fn parse_request(msg: &[u8]) -> Option<DeviceId> {
 
 fn parse_announce(msg: &[u8], from: SocketAddr) -> Option<Peer> {
     let text = std::str::from_utf8(msg).ok()?;
-    let mut parts = text.splitn(5, ' ');
+    let mut parts = text.splitn(6, ' ');
     if parts.next()? != ANNOUNCE_PREFIX {
         return None;
     }
     let port: u16 = parts.next()?.parse().ok()?;
     let id: DeviceId = parts.next()?.parse().ok()?;
     let mutual = parts.next()? == "1";
+    let kind = DeviceKind::from_code(parts.next()?);
     let name = clean_name(parts.next().unwrap_or(""));
     Some(Peer {
         addr: SocketAddr::new(from.ip(), port),
         id,
         name,
         mutual,
+        kind,
     })
 }
 
@@ -129,11 +132,13 @@ mod tests {
     fn announce_round_trip() {
         let id = DeviceId::random();
         let from: SocketAddr = "192.168.1.5:5555".parse().unwrap();
-        let peer = parse_announce(format!("{ANNOUNCE_PREFIX} 47800 {id} 1 Living room Mac").as_bytes(), from).unwrap();
+        let peer = parse_announce(format!("{ANNOUNCE_PREFIX} 47800 {id} 1 d Living room Mac").as_bytes(), from).unwrap();
         assert_eq!(peer.addr, "192.168.1.5:47800".parse().unwrap());
         assert_eq!((peer.id, peer.mutual, peer.name.as_str()), (id, true, "Living room Mac"));
-        // The version 1 format has no id and must not parse.
+        assert_eq!(peer.kind, DeviceKind::Desktop);
+        // Older formats lack the id or the kind and must not parse.
         assert!(parse_announce(b"AIRLYNX_HERE 47800 Old Mac", from).is_none());
+        assert!(parse_announce(format!("{ANNOUNCE_PREFIX} 47800 {id} 1").as_bytes(), from).is_none());
     }
 
     #[test]

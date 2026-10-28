@@ -75,16 +75,62 @@ impl FromStr for DeviceId {
     }
 }
 
+/// What sort of device this is, shown as an icon next to its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceKind {
+    #[default]
+    Unknown,
+    Desktop,
+    Mobile,
+}
+
+impl DeviceKind {
+    /// One letter on the wire (discovery replies).
+    pub fn code(self) -> char {
+        match self {
+            DeviceKind::Unknown => '?',
+            DeviceKind::Desktop => 'd',
+            DeviceKind::Mobile => 'm',
+        }
+    }
+
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "d" => DeviceKind::Desktop,
+            "m" => DeviceKind::Mobile,
+            _ => DeviceKind::Unknown,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            DeviceKind::Unknown => "unknown",
+            DeviceKind::Desktop => "desktop",
+            DeviceKind::Mobile => "mobile",
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        [DeviceKind::Unknown, DeviceKind::Desktop, DeviceKind::Mobile].into_iter().find(|k| k.word() == word)
+    }
+}
+
 /// Who we are on the network: the id plus the display name.
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub id: DeviceId,
     pub name: String,
+    pub kind: DeviceKind,
 }
 
 impl Identity {
     pub fn new(id: DeviceId, name: &str) -> Self {
-        Self { id, name: clean_name(name) }
+        Self { id, name: clean_name(name), kind: DeviceKind::Unknown }
+    }
+
+    pub fn with_kind(mut self, kind: DeviceKind) -> Self {
+        self.kind = kind;
+        self
     }
 }
 
@@ -106,6 +152,7 @@ pub fn clean_name(raw: &str) -> String {
 pub struct Favorite {
     pub id: DeviceId,
     pub name: String,
+    pub kind: DeviceKind,
 }
 
 /// The set of trusted devices. Cloning shares the same list, so the receiver
@@ -150,16 +197,22 @@ impl Favorites {
         inner.list.clone()
     }
 
-    /// Adds a device, or updates its stored name if it is already a favorite.
-    /// The change stays in memory even if saving fails.
-    pub fn add(&self, id: DeviceId, name: &str) -> io::Result<()> {
+    /// Adds a device, or updates its stored name and kind if it is already a favorite.
+    /// An `Unknown` kind never replaces a known one. The change stays in memory even if saving fails.
+    pub fn add(&self, id: DeviceId, name: &str, kind: DeviceKind) -> io::Result<()> {
         let name = clean_name(name);
         let mut inner = self.inner.lock().unwrap();
         inner.refresh();
         match inner.list.iter_mut().find(|f| f.id == id) {
-            Some(existing) if existing.name == name => return Ok(()),
-            Some(existing) => existing.name = name,
-            None => inner.list.push(Favorite { id, name }),
+            Some(existing) => {
+                let kind = if kind == DeviceKind::Unknown { existing.kind } else { kind };
+                if existing.name == name && existing.kind == kind {
+                    return Ok(());
+                }
+                existing.name = name;
+                existing.kind = kind;
+            }
+            None => inner.list.push(Favorite { id, name, kind }),
         }
         inner.save()
     }
@@ -183,8 +236,16 @@ impl FavoritesInner {
             Ok(text) => text
                 .lines()
                 .filter_map(|line| {
-                    let (id, name) = line.split_once(' ')?;
-                    Some(Favorite { id: id.parse().ok()?, name: clean_name(name) })
+                    let (id, rest) = line.split_once(' ')?;
+                    // Lines are `<id> kind:<kind> <name>`; older files have `<id> <name>`.
+                    let (kind, name) = match rest.split_once(' ') {
+                        Some((word, name)) => match word.strip_prefix("kind:").and_then(DeviceKind::from_word) {
+                            Some(kind) => (kind, name),
+                            None => (DeviceKind::Unknown, rest),
+                        },
+                        None => (DeviceKind::Unknown, rest),
+                    };
+                    Some(Favorite { id: id.parse().ok()?, name: clean_name(name), kind })
                 })
                 .collect(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -203,7 +264,7 @@ impl FavoritesInner {
 
     fn save(&mut self) -> io::Result<()> {
         let Some(path) = &self.path else { return Ok(()) };
-        let text: String = self.list.iter().map(|f| format!("{} {}\n", f.id, f.name)).collect();
+        let text: String = self.list.iter().map(|f| format!("{} kind:{} {}\n", f.id, f.kind.word(), f.name)).collect();
         write_atomic(path, &text)?;
         self.mtime = self.file_mtime();
         Ok(())
@@ -268,7 +329,7 @@ mod tests {
         let b = Profile::load(&dir).unwrap().favorites;
         let friend = DeviceId::random();
         assert!(!a.contains(friend));
-        b.add(friend, "Phone").unwrap();
+        b.add(friend, "Phone", DeviceKind::Mobile).unwrap();
         // Same-second writes can share a modification time on some filesystems.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(a.contains(friend));
@@ -280,17 +341,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("airlynx-test-{}", DeviceId::random()));
         let first = Profile::load(&dir).unwrap();
         let friend = DeviceId::random();
-        first.favorites.add(friend, "Mac mini").unwrap();
-        first.favorites.add(friend, "Mac mini 2").unwrap();
+        first.favorites.add(friend, "Mac mini", DeviceKind::Desktop).unwrap();
+        first.favorites.add(friend, "Mac mini 2", DeviceKind::Unknown).unwrap();
 
         let second = Profile::load(&dir).unwrap();
         assert_eq!(second.id, first.id);
         let list = second.favorites.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Mac mini 2");
+        // An unknown kind does not erase a known one.
+        assert_eq!(list[0].kind, DeviceKind::Desktop);
 
         second.favorites.remove(friend).unwrap();
         assert!(!Profile::load(&dir).unwrap().favorites.contains(friend));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_favorites_files_still_load() {
+        let dir = std::env::temp_dir().join(format!("airlynx-test-{}", DeviceId::random()));
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (DeviceId::random(), DeviceId::random());
+        fs::write(dir.join("favorites"), format!("{a} Old Mac\n{b} kind:mobile Pixel 3a\n")).unwrap();
+        let list = Profile::load(&dir).unwrap().favorites.list();
+        assert_eq!((list[0].name.as_str(), list[0].kind), ("Old Mac", DeviceKind::Unknown));
+        assert_eq!((list[1].name.as_str(), list[1].kind), ("Pixel 3a", DeviceKind::Mobile));
         let _ = fs::remove_dir_all(dir);
     }
 }

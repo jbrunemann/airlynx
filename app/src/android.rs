@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use winit::platform::android::activity::AndroidApp;
+use airlynx_core::DeviceKind;
 use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 
@@ -32,6 +33,10 @@ fn with_env<R>(f: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> jni::errors::Res
 
 fn java_string(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> jni::errors::Result<String> {
     Ok(env.get_string(&JString::from(obj))?.into())
+}
+
+pub fn device_kind() -> DeviceKind {
+    DeviceKind::Mobile
 }
 
 pub fn device_name() -> String {

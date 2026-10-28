@@ -7,5 +7,5 @@ pub mod receive;
 pub mod send;
 
 pub use discovery::{Peer, discover};
-pub use identity::{DeviceId, Favorite, Favorites, Identity, Profile};
+pub use identity::{DeviceId, DeviceKind, Favorite, Favorites, Identity, Profile};
 pub use protocol::{DEFAULT_TCP_PORT, DISCOVERY_PORT, human_size};

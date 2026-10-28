@@ -15,13 +15,13 @@ use std::io::{self, Read, Write};
 use crate::identity::{DeviceId, Identity, clean_name};
 
 pub const MAGIC: &[u8; 4] = b"ALNX";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 pub const DEFAULT_TCP_PORT: u16 = 47800;
 pub const DISCOVERY_PORT: u16 = 47801;
 /// Followed by the asking device's id.
 pub const DISCOVER_PREFIX: &str = "AIRLYNX_DISCOVER";
-/// Followed by `<tcp_port> <id> <mutual 0|1> <name>`.
+/// Followed by `<tcp_port> <id> <mutual 0|1> <kind d|m|?> <name>`.
 pub const ANNOUNCE_PREFIX: &str = "AIRLYNX_HERE";
 
 pub const MAX_NAME_LEN: usize = 1024;

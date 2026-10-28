@@ -8,7 +8,12 @@ pub use crate::android::*;
 
 #[cfg(not(target_os = "android"))]
 mod desktop {
+    use airlynx_core::DeviceKind;
     use std::path::{Path, PathBuf};
+
+    pub fn device_kind() -> DeviceKind {
+        DeviceKind::Desktop
+    }
 
     pub fn device_name() -> String {
         let name = gethostname::gethostname().to_string_lossy().into_owned();
