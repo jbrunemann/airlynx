@@ -57,7 +57,7 @@ Cargo workspace (edition 2024, resolver 3):
 | `core/src/send.rs` | | `prepare()` validates paths, `send_files()` streams them with a progress callback (`ControlFlow::Break` cancels), `resolve()` parses `host[:port]` |
 | `core/src/receive.rs` | | `start()` returns a `ReceiverHandle` (stops on `stop()`/drop) and emits `ReceiveEvent`s; refuses non-favorites; filename sanitizing and `name (1).ext` dedup |
 | `cli/src/main.rs` | `airlynx` | clap CLI: `send`, `receive`, `discover`, `favorite` |
-| `app/src/app.rs` | `airlynx-app` | The egui UI shared by desktop and Android: one scrolling screen with Files, Favorites, Nearby, Receiving |
+| `app/src/app.rs` | `airlynx-app` | The egui UI shared by desktop and Android: two tabs: Transfer (Files, Favorites, Nearby, Receiving) and History (what was received) |
 | `app/src/platform.rs` | | Platform facade: desktop impl inline (rfd dialogs, `dirs`, `open`), Android re-exports `android.rs` |
 | `app/src/android.rs` | | JNI glue: device model, config dir, all-files-access check/request, multicast lock, status bar height |
 | `app/src/browser.rs` | | In-app file browser (Android only) |

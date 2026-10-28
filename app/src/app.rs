@@ -23,6 +23,24 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(6);
 /// UDP packet does not make a favorite flicker offline.
 const PEER_TTL: Duration = Duration::from_secs(20);
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Tab {
+    #[default]
+    Transfer,
+    History,
+}
+
+impl Tab {
+    const ALL: [Tab; 2] = [Tab::Transfer, Tab::History];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Transfer => "Transfer",
+            Tab::History => "History",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 enum SendStatus {
     #[default]
@@ -104,6 +122,7 @@ pub struct AirLynxApp {
     identity: Identity,
     favorites: Favorites,
     notice: Option<String>,
+    tab: Tab,
     files: Vec<Entry>,
     file_error: Option<String>,
     receive_dir: PathBuf,
@@ -141,6 +160,7 @@ impl AirLynxApp {
             identity: Identity::new(profile.id, &device_name),
             favorites: profile.favorites,
             notice,
+            tab: Tab::default(),
             files: Vec::new(),
             file_error: None,
             receive_dir: platform::default_receive_dir(),
@@ -304,6 +324,14 @@ impl AirLynxApp {
             }
         }
         ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    /// The Android file browser replaces the whole screen, so the tabs are hidden while it is open.
+    fn browsing(&self) -> bool {
+        #[cfg(target_os = "android")]
+        return self.browser.is_some();
+        #[cfg(not(target_os = "android"))]
+        false
     }
 
     fn apply(&mut self, ctx: &egui::Context, actions: Actions) {
@@ -560,12 +588,15 @@ impl AirLynxApp {
                 ui.add(egui::ProgressBar::new(fraction).show_percentage());
             }
         }
-        if !s.log.is_empty() {
-            section(ui, "History");
-            for line in s.log.iter().rev() {
-                let color = if line.ok { ui.visuals().text_color() } else { ERR_COLOR };
-                ui.colored_label(color, &line.text);
-            }
+    }
+
+    fn history_tab(&self, ui: &mut egui::Ui, s: &Shared) {
+        if s.log.is_empty() {
+            ui.label(RichText::new("Nothing received yet.").weak());
+        }
+        for line in s.log.iter().rev() {
+            let color = if line.ok { ui.visuals().text_color() } else { ERR_COLOR };
+            ui.colored_label(color, &line.text);
         }
     }
 }
@@ -633,6 +664,13 @@ impl eframe::App for AirLynxApp {
             if let Some(notice) = &self.notice {
                 ui.colored_label(ERR_COLOR, notice);
             }
+            if !self.browsing() {
+                ui.horizontal(|ui| {
+                    for tab in Tab::ALL {
+                        ui.selectable_value(&mut self.tab, tab, tab.label());
+                    }
+                });
+            }
             ui.add_space(4.0);
         });
 
@@ -653,12 +691,15 @@ impl eframe::App for AirLynxApp {
             let shared = self.shared.lock().unwrap().clone();
             let sending = matches!(shared.send, SendStatus::Sending(_));
             let mut actions = Actions::default();
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                self.files_section(ui, sending);
-                self.favorites_section(ui, &shared, sending, &mut actions);
-                self.send_status(ui, &shared);
-                self.nearby_section(ui, &shared, &mut actions);
-                self.receive_section(ui, &ctx, &shared, &mut actions);
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.tab {
+                Tab::Transfer => {
+                    self.files_section(ui, sending);
+                    self.favorites_section(ui, &shared, sending, &mut actions);
+                    self.send_status(ui, &shared);
+                    self.nearby_section(ui, &shared, &mut actions);
+                    self.receive_section(ui, &ctx, &shared, &mut actions);
+                }
+                Tab::History => self.history_tab(ui, &shared),
             });
             self.apply(&ctx, actions);
         });
