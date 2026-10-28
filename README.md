@@ -10,6 +10,8 @@ never lists itself under Add a device.
 
 **Status:** working prototype (v0.3.0). The favorites flow was tested end to end between two CLI
 profiles on one Mac. The v0.2 send/receive flows were tested on a Pixel 3a API 34 emulator and on macOS.
+The redesigned UI (see "UI design") was checked on the emulator in light and dark mode. Its desktop
+layout (sidebar, two columns) has only been compiled, not looked at, because screen capture was unavailable.
 It has not been tested on a physical phone yet.
 
 ---
@@ -132,6 +134,29 @@ actively sits in the middle of a connection could still read it. See "Security" 
 
 ---
 
+## UI design
+
+The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `app/src/theme.rs`).
+
+- **Pages:** **Send** (files, favorites as device cards, Add a device), **Received** (incoming transfers, requests
+  from non-favorites, history), **Settings** (this device, save folder, file access, favorites with Remove).
+  Window width picks the layout: 720 px or more gets a left sidebar and two columns on Send, anything narrower
+  (all phones) gets a header and a bottom tab bar. The Android file browser replaces the page and hides the tab bar.
+- **Flow:** choose files, then press **Send** on an online, mutual favorite. While sending, that card shows the
+  progress bar, byte counts and **Cancel**, and the other Send buttons are disabled. The result is a dismissible
+  banner at the top of Send. The Received tab badge counts unseen files plus pending requests.
+- **Theme:** `theme::LIGHT` and `theme::DARK` palettes, picked by `theme::pal(ui)` from egui's dark mode. Colors come from
+  the app icon (indigo accent, navy text) plus green, amber and red for status. All widgets are painted in
+  `theme.rs` (`card`, `button`, `icon_button`, `tile`, `pill`, `progress`, `logo`) and the icons are drawn with
+  shapes on a 24 by 24 grid (`theme::Icon`), so no icon font or images are needed. Controls are 44 pt high on
+  Android and 38 pt on desktop.
+- **Fonts:** Inter Regular and SemiBold from `assets/fonts/` replace egui's thin default text font. Headings, names
+  and button labels use the `theme::bold()` family. The mockups the design came from were made on a Claude Design canvas
+  and are not in the repo.
+- **Dark mode on Android** is read over JNI (see the gotchas). On desktop egui follows the system setting.
+
+---
+
 ## Toolchain and environment
 
 - Rust 1.95+, target `aarch64-linux-android`
@@ -157,6 +182,7 @@ $ADB shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow   # skip the
 $ADB shell am start -n dev.airlynx.app/android.app.NativeActivity
 $ADB exec-out screencap -p > shot.png                                # look at the UI
 $ADB shell input tap X Y                                             # drive it (physical px, 1080x2220)
+$ADB shell cmd uimode night yes                                      # dark mode (no = light)
 $ADB logcat | grep -i airlynx
 ```
 
@@ -222,10 +248,13 @@ Rough priority order:
    active man in the middle can read a session. Fix: a pairing step that exchanges a secret or public key when two
    devices favorite each other (for example a short code shown on both screens), then use it to authenticate the
    key exchange. Discovery packets are still plaintext.
-4. **Receiver UX:** a cancel button for incoming transfers, persisted history,
-   and a notification when a file arrives.
-5. **Packaging:** a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.
-6. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
+4. **Receiver UX:** a cancel button for incoming transfers, persisted history (it is in memory only, and ages
+   show as "5 min ago" because no wall-clock time is kept), and a notification when a file arrives.
+5. **UI follow-ups:** look at the desktop layout on a real screen and fix what is off, per-type file icons (every file
+   uses the same tile), a gradient on the logo and progress bar (only the icon PNG has one), and an Unfavorite shortcut
+   on the device card (it now lives only in Settings).
+6. **Packaging:** a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.
+7. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
    and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
 
 ### Icebox
