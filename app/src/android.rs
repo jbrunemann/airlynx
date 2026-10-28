@@ -58,6 +58,14 @@ pub fn default_receive_dir() -> PathBuf {
         .join("received")
 }
 
+/// Where the device id and favorites live: the app's private storage, which needs no permission.
+pub fn config_dir() -> PathBuf {
+    APP.get()
+        .and_then(|app| app.internal_data_path())
+        .unwrap_or_else(|| PathBuf::from("/data/local/tmp"))
+        .join("config")
+}
+
 pub fn has_all_files_access() -> bool {
     with_env(|env, _| {
         env.call_static_method("android/os/Environment", "isExternalStorageManager", "()Z", &[])?

@@ -57,16 +57,17 @@ dependencies = [
 
 [[package]]
 name = "airlynx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airlynx-core",
  "clap",
+ "dirs",
  "gethostname",
 ]
 
 [[package]]
 name = "airlynx-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airlynx-core",
  "android_logger",
@@ -81,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "airlynx-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "sha2",
 ]

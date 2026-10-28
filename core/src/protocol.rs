@@ -2,6 +2,9 @@
 //!
 //! Session (sender -> receiver, all integers big-endian):
 //!   "ALNX" | version: u8                      -> receiver replies one status byte
+//!                                               (only on a version mismatch, which ends the session)
+//!   sender id: [u8; 16] | name len: u8 | name: UTF-8
+//!                                             -> receiver replies one status byte
 //!   file count: u32
 //!   per file:
 //!     name len: u16 | name: UTF-8 | size: u64 | data | sha256: [u8; 32]
@@ -9,20 +12,26 @@
 
 use std::io::{self, Read, Write};
 
+use crate::identity::{DeviceId, Identity, clean_name};
+
 pub const MAGIC: &[u8; 4] = b"ALNX";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 pub const DEFAULT_TCP_PORT: u16 = 47800;
 pub const DISCOVERY_PORT: u16 = 47801;
-pub const DISCOVER_MSG: &[u8] = b"AIRLYNX_DISCOVER";
+/// Followed by the asking device's id.
+pub const DISCOVER_PREFIX: &str = "AIRLYNX_DISCOVER";
+/// Followed by `<tcp_port> <id> <mutual 0|1> <name>`.
 pub const ANNOUNCE_PREFIX: &str = "AIRLYNX_HERE";
 
 pub const MAX_NAME_LEN: usize = 1024;
+pub const MAX_DEVICE_NAME_LEN: usize = 64;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_HASH_MISMATCH: u8 = 1;
 pub const STATUS_REJECTED: u8 = 2;
+pub const STATUS_NOT_FAVORITE: u8 = 3;
 
 pub fn read_u8(r: &mut impl Read) -> io::Result<u8> {
     let mut b = [0u8; 1];
@@ -46,6 +55,26 @@ pub fn read_u64(r: &mut impl Read) -> io::Result<u64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(u64::from_be_bytes(b))
+}
+
+pub fn write_hello(w: &mut impl Write, me: &Identity) -> io::Result<()> {
+    let name = clean_name(&me.name);
+    w.write_all(me.id.as_bytes())?;
+    w.write_all(&[name.len() as u8])?;
+    w.write_all(name.as_bytes())
+}
+
+pub fn read_hello(r: &mut impl Read) -> io::Result<Identity> {
+    let mut id = [0u8; 16];
+    r.read_exact(&mut id)?;
+    let len = read_u8(r)? as usize;
+    if len > MAX_DEVICE_NAME_LEN {
+        return Err(invalid("device name too long"));
+    }
+    let mut name = vec![0u8; len];
+    r.read_exact(&mut name)?;
+    let name = String::from_utf8(name).map_err(|_| invalid("device name is not UTF-8"))?;
+    Ok(Identity::new(DeviceId::from_bytes(id), &name))
 }
 
 pub fn write_file_header(w: &mut impl Write, name: &str, size: u64) -> io::Result<()> {

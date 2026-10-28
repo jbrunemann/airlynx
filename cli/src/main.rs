@@ -7,19 +7,22 @@ use std::thread;
 use std::time::Duration;
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig};
-use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, discover, human_size, send};
+use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, Identity, Peer, Profile, discover, human_size, send};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "airlynx", version, about = "Send files to another device on the local network")]
 struct Cli {
+    /// Where the device id and favorites are stored (shared with the desktop app by default)
+    #[arg(long, global = true)]
+    config_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Wait for incoming files
+    /// Wait for incoming files from your favorites
     Receive {
         /// Directory to save files into
         #[arg(short, long, default_value = "received")]
@@ -31,44 +34,52 @@ enum Command {
         #[arg(short, long)]
         name: Option<String>,
     },
-    /// Send one or more files
+    /// Send one or more files to a favorite, or to an address
     Send {
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Receiver as IP, host, or host:port (skips discovery)
+        /// Favorite name or id (prefix) to send to
         #[arg(short, long)]
+        device: Option<String>,
+        /// Receiver as IP, host, or host:port (skips discovery)
+        #[arg(short, long, conflicts_with = "device")]
         to: Option<String>,
         /// Seconds to wait for discovery replies
         #[arg(long, default_value_t = 2)]
         wait: u64,
     },
-    /// List receivers on the network
+    /// List other AirLynx devices on the network
     Discover {
         /// Seconds to wait for replies
         #[arg(long, default_value_t = 2)]
         wait: u64,
     },
+    /// Manage favorite devices
+    #[command(subcommand)]
+    Favorite(FavoriteCommand),
+}
+
+#[derive(Subcommand)]
+enum FavoriteCommand {
+    /// Show favorites
+    List,
+    /// Add a device found on the network, by name or id (prefix), or any device by its full id
+    Add {
+        device: String,
+        /// Name to store when adding by full id
+        #[arg(long)]
+        name: Option<String>,
+        /// Seconds to wait for discovery replies
+        #[arg(long, default_value_t = 2)]
+        wait: u64,
+    },
+    /// Remove a favorite, by name or id (prefix)
+    Remove { device: String },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Receive { dir, port, name } => {
-            let name = name.unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
-            run_receive(ReceiverConfig { dir, port, name })
-        }
-        Command::Send { files, to, wait } => run_send(files, to, Duration::from_secs(wait)),
-        Command::Discover { wait } => discover(Duration::from_secs(wait)).map(|peers| {
-            if peers.is_empty() {
-                println!("No receivers found");
-            }
-            for p in peers {
-                println!("{}  \"{}\"", p.addr, p.name);
-            }
-        }),
-    };
-
-    match result {
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -77,10 +88,93 @@ fn main() -> ExitCode {
     }
 }
 
+fn run(cli: Cli) -> io::Result<()> {
+    let dir = cli
+        .config_dir
+        .or_else(|| dirs::config_dir().map(|d| d.join("AirLynx")))
+        .ok_or_else(|| io::Error::other("no config directory; pass --config-dir"))?;
+    let profile = Profile::load(&dir)?;
+    let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+    let me = Identity::new(profile.id, hostname.strip_suffix(".local").unwrap_or(&hostname));
+
+    match cli.command {
+        Command::Receive { dir, port, name } => {
+            let me = name.map_or(me.clone(), |n| Identity::new(me.id, &n));
+            run_receive(ReceiverConfig { dir, port, identity: me, favorites: profile.favorites })
+        }
+        Command::Send { files, device, to, wait } => run_send(&profile, &me, files, device, to, Duration::from_secs(wait)),
+        Command::Discover { wait } => {
+            let peers = discover(&me, Duration::from_secs(wait))?;
+            if peers.is_empty() {
+                println!("No devices found");
+            }
+            for p in peers {
+                let favorite = if profile.favorites.contains(p.id) { "favorite" } else { "" };
+                let mutual = if p.mutual { "has you as favorite" } else { "" };
+                println!("{}  {}  {:<24} {favorite} {mutual}", p.id, p.addr, format!("\"{}\"", p.name));
+            }
+            Ok(())
+        }
+        Command::Favorite(FavoriteCommand::List) => {
+            let list = profile.favorites.list();
+            if list.is_empty() {
+                println!("No favorites yet. Try `airlynx discover`, then `airlynx favorite add <name>`");
+            }
+            for f in list {
+                println!("{}  \"{}\"", f.id, f.name);
+            }
+            Ok(())
+        }
+        Command::Favorite(FavoriteCommand::Add { device, name, wait }) => {
+            if let Ok(id) = device.parse::<DeviceId>() {
+                let name = name.unwrap_or_else(|| format!("device {}", id.short()));
+                profile.favorites.add(id, &name)?;
+                println!("Added \"{name}\" ({}) as a favorite", id.short());
+                return Ok(());
+            }
+            let peers = discover(&me, Duration::from_secs(wait))?;
+            let peer = pick(&peers, &device, |p| (p.id, &p.name))?;
+            profile.favorites.add(peer.id, &peer.name)?;
+            println!("Added \"{}\" ({}) as a favorite", peer.name, peer.id.short());
+            if !peer.mutual {
+                println!("They need to add this device too before files can be exchanged.");
+            }
+            Ok(())
+        }
+        Command::Favorite(FavoriteCommand::Remove { device }) => {
+            let list = profile.favorites.list();
+            let favorite = pick(&list, &device, |f| (f.id, &f.name))?;
+            profile.favorites.remove(favorite.id)?;
+            println!("Removed \"{}\"", favorite.name);
+            Ok(())
+        }
+    }
+}
+
+/// Finds the single item whose name equals `query` (ignoring case) or whose id starts with it.
+fn pick<'a, T>(items: &'a [T], query: &str, key: impl Fn(&T) -> (DeviceId, &String)) -> io::Result<&'a T> {
+    let query = query.to_lowercase();
+    let matches: Vec<&T> = items
+        .iter()
+        .filter(|item| {
+            let (id, name) = key(item);
+            name.to_lowercase() == query || id.to_string().starts_with(&query)
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => Err(io::Error::new(io::ErrorKind::NotFound, format!("no device matches {query:?}"))),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{query:?} matches several devices; use more of the id"))),
+    }
+}
+
 fn run_receive(config: ReceiverConfig) -> io::Result<()> {
     let dir = config.dir.clone();
-    let name = config.name.clone();
+    let name = config.identity.name.clone();
     let handle = receive::start(config, |event| match event {
+        ReceiveEvent::Refused { peer, id, name } => {
+            eprintln!("[{peer}] refused \"{name}\" ({id}): not a favorite. Add it with `airlynx favorite add {id} --name \"{name}\"`")
+        }
         ReceiveEvent::Connected { peer, files } => println!("[{peer}] receiving {files} file(s)"),
         ReceiveEvent::FileSaved { peer, path, size } => {
             println!("[{peer}] saved {} ({})", path.display(), human_size(size))
@@ -101,16 +195,23 @@ fn run_receive(config: ReceiverConfig) -> io::Result<()> {
     }
 }
 
-fn run_send(files: Vec<PathBuf>, to: Option<String>, wait: Duration) -> io::Result<()> {
+fn run_send(
+    profile: &Profile,
+    me: &Identity,
+    files: Vec<PathBuf>,
+    device: Option<String>,
+    to: Option<String>,
+    wait: Duration,
+) -> io::Result<()> {
     let entries = send::prepare(files)?;
-    let addr = match to {
-        Some(target) => send::resolve(&target)?,
-        None => pick_receiver(wait)?,
+    let addr = match (to, device) {
+        (Some(target), _) => send::resolve(&target)?,
+        (None, device) => pick_receiver(profile, me, device.as_deref(), wait)?,
     };
 
     println!("Connecting to {addr}...");
     let mut last_file = usize::MAX;
-    let report = send::send_files(addr, &entries, |p| {
+    let report = send::send_files(addr, me, &entries, |p| {
         if p.file_sent == p.file_size && p.file_index != last_file {
             last_file = p.file_index;
             println!("  sent {} ({})", p.file_name, human_size(p.file_size));
@@ -134,24 +235,35 @@ fn run_send(files: Vec<PathBuf>, to: Option<String>, wait: Duration) -> io::Resu
     Ok(())
 }
 
-fn pick_receiver(wait: Duration) -> io::Result<SocketAddr> {
-    println!("Looking for receivers...");
-    let peers = discover(wait)?;
-    match peers.as_slice() {
-        [] => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no receivers found; is `airlynx receive` running? You can also pass --to <ip>",
-        )),
-        [peer] => {
-            println!("Found \"{}\" at {}", peer.name, peer.addr);
-            Ok(peer.addr)
-        }
-        many => {
-            eprintln!("Multiple receivers found, pick one with --to:");
-            for p in many {
-                eprintln!("  {}  \"{}\"", p.addr, p.name);
+/// Finds a favorite on the network: the named one, or the only one online.
+fn pick_receiver(profile: &Profile, me: &Identity, device: Option<&str>, wait: Duration) -> io::Result<SocketAddr> {
+    println!("Looking for favorites...");
+    let favorites: Vec<Peer> = discover(me, wait)?
+        .into_iter()
+        .filter(|p| profile.favorites.contains(p.id))
+        .collect();
+    let peer = match device {
+        Some(query) => pick(&favorites, query, |p| (p.id, &p.name))?,
+        None => match favorites.as_slice() {
+            [] => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no favorite is online; add one with `airlynx favorite add <name>`, or pass --to <ip>",
+                ));
             }
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "ambiguous receiver"))
-        }
+            [peer] => peer,
+            many => {
+                eprintln!("Several favorites are online, pick one with --device:");
+                for p in many {
+                    eprintln!("  \"{}\"  {}", p.name, p.addr);
+                }
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "ambiguous receiver"));
+            }
+        },
+    };
+    if !peer.mutual {
+        eprintln!("Note: \"{}\" has not added this device as a favorite yet, so it will probably refuse.", peer.name);
     }
+    println!("Found \"{}\" at {}", peer.name, peer.addr);
+    Ok(peer.addr)
 }

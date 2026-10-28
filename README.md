@@ -3,8 +3,14 @@
 Local-network file transfer between Android and macOS (and anything else that runs Rust).
 Devices find each other with UDP broadcast. Files go over TCP with a SHA-256 check per file.
 
-**Status:** working prototype (v0.2.0). Both directions were tested end to end on a
-Pixel 3a API 34 emulator and on macOS. It has not been tested on a physical phone yet.
+**Favorites:** each install has a random device id. A device only accepts files from devices it has
+added as favorites. When two devices have added each other (a mutual favorite), either one can send to
+the other at any time, with no prompt. The receiver is always on while the app is open, and a device
+never lists itself under Nearby.
+
+**Status:** working prototype (v0.3.0). The favorites flow was tested end to end between two CLI
+profiles on one Mac. The v0.2 send/receive flows were tested on a Pixel 3a API 34 emulator and on macOS.
+It has not been tested on a physical phone yet.
 
 ---
 
@@ -19,11 +25,18 @@ cargo run --release -p airlynx-app          # or run without bundling
 ./scripts/build-apk.sh                      # -> target/release/apk/AirLynx.apk
 ./scripts/build-apk.sh --install            # build + adb install
 
-# CLI
+# CLI (same profile as the desktop app unless --config-dir is given)
 cargo run --release -p airlynx -- receive --dir ./received
-cargo run --release -p airlynx -- discover
-cargo run --release -p airlynx -- send a.jpg b.pdf [--to 192.168.1.20[:port]]
+cargo run --release -p airlynx -- discover                  # lists id, address, favorite / has-you-as-favorite
+cargo run --release -p airlynx -- favorite add "Pixel"      # by name or id prefix; a full id works offline
+cargo run --release -p airlynx -- favorite list | remove <name>
+cargo run --release -p airlynx -- send a.jpg b.pdf --device Pixel   # or --to 192.168.1.20[:port]
 ```
+
+**Pairing in the app:** open AirLynx on both devices. Under **Nearby**, tap **Add favorite** on the other
+device, and do the same on the other device. The favorite then shows **Online**, and **Send** is enabled once
+files are chosen. If a device that is not a favorite tries to send, the receiver shows a request under
+**Receiving** with an **Add favorite** button, which also works when discovery cannot find the device.
 
 On Android, tap **Grant file access** and enable "All files access". The built-in
 file browser needs it, and received files then go to `Download/AirLynx`.
@@ -37,14 +50,15 @@ Cargo workspace (edition 2024, resolver 3):
 
 | Path | Crate | Purpose |
 |------|-------|---------|
-| `core/src/protocol.rs` | `airlynx-core` | Constants (ports, magic, status codes), big-endian read helpers, `human_size` |
-| `core/src/discovery.rs` | | `discover()` broadcasts and collects `Peer`s; responder thread used by the receiver |
+| `core/src/protocol.rs` | `airlynx-core` | Constants (ports, magic, status codes), big-endian read helpers, handshake hello, `human_size` |
+| `core/src/identity.rs` | | `DeviceId`, `Identity`, `Favorites` (shared, persisted, reloads when the file changes on disk), `Profile` (id + favorites in one directory) |
+| `core/src/discovery.rs` | | `discover()` broadcasts and collects `Peer`s (never including the caller); responder thread used by the receiver |
 | `core/src/send.rs` | | `prepare()` validates paths, `send_files()` streams them with a progress callback (`ControlFlow::Break` cancels), `resolve()` parses `host[:port]` |
-| `core/src/receive.rs` | | `start()` returns a `ReceiverHandle` (stops on `stop()`/drop) and emits `ReceiveEvent`s; filename sanitizing and `name (1).ext` dedup |
-| `cli/src/main.rs` | `airlynx` | clap CLI: `send`, `receive`, `discover` |
-| `app/src/app.rs` | `airlynx-app` | The egui UI shared by desktop and Android (Send/Receive tabs) |
+| `core/src/receive.rs` | | `start()` returns a `ReceiverHandle` (stops on `stop()`/drop) and emits `ReceiveEvent`s; refuses non-favorites; filename sanitizing and `name (1).ext` dedup |
+| `cli/src/main.rs` | `airlynx` | clap CLI: `send`, `receive`, `discover`, `favorite` |
+| `app/src/app.rs` | `airlynx-app` | The egui UI shared by desktop and Android: one scrolling screen with Files, Favorites, Nearby, Receiving |
 | `app/src/platform.rs` | | Platform facade: desktop impl inline (rfd dialogs, `dirs`, `open`), Android re-exports `android.rs` |
-| `app/src/android.rs` | | JNI glue: device model, all-files-access check/request, multicast lock, status bar height |
+| `app/src/android.rs` | | JNI glue: device model, config dir, all-files-access check/request, multicast lock, status bar height |
 | `app/src/browser.rs` | | In-app file browser (Android only) |
 | `app/src/lib.rs` | | Module wiring and `android_main` entry point |
 | `app/src/main.rs` | | Desktop entry point |
@@ -54,23 +68,31 @@ Cargo workspace (edition 2024, resolver 3):
 ### Threading model (app)
 
 All networking runs on background threads. They write into `Arc<Mutex<Shared>>` and call
-`ctx.request_repaint()`. The UI only reads `Shared` each frame. One thread runs per scan, per
-send, and per incoming connection. The receiver also has an accept thread and a discovery
-responder thread, and both poll a stop flag.
+`ctx.request_repaint()`. The UI clones `Shared` each frame and records what the user did in an `Actions`
+value that is applied after drawing. One thread runs per scan, per send, and per incoming connection. The
+receiver also has an accept thread and a discovery responder thread, and both poll a stop flag.
+The app rescans every 6 s, and a device stays "online" for 20 s after its last answer.
+
+Identity and favorites are stored in `<config dir>/AirLynx` on desktop (`~/Library/Application Support/AirLynx`
+on macOS) and in the app's private `files/config` on Android, as `device-id` and `favorites` text files.
 
 ---
 
-## Protocol (version 1)
+## Protocol (version 2)
 
-**Discovery** on UDP 47801. The sender broadcasts `AIRLYNX_DISCOVER` to `255.255.255.255` twice.
-Receivers reply `AIRLYNX_HERE <tcp_port> <name>` to the sender's address.
+**Discovery** on UDP 47801. A device broadcasts `AIRLYNX_DISCOVER <id>` to `255.255.255.255` twice, where
+`<id>` is its 32-hex-digit device id. Every other running device replies
+`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <name>` to the asker's address. `mutual` is 1 when the replier has
+the asker as a favorite. The asker drops replies carrying its own id and de-duplicates by id.
 
 **Transfer** on TCP 47800 (default). There is one connection per send session, and all integers are big-endian:
 
 ```
 sender                                       receiver
 "ALNX" | version u8                    ->
-                                       <-    status u8   (0 ok, 2 rejected)
+                                       <-    status u8   (2 rejected; sent only on a version mismatch, which ends the session)
+sender id [u8;16] | name_len u8 | name ->
+                                       <-    status u8   (0 ok, 3 sender is not a favorite)
 file count u32                         ->
 per file:
   name_len u16 | name (UTF-8) | size u64 | data | sha256[32]  ->
@@ -82,6 +104,10 @@ after the hash matches. Names are reduced to their last path component, so they 
 the target directory.
 
 Changing the wire format means bumping `VERSION` in `core/src/protocol.rs`.
+
+**Trust model:** the sender id is a plain identifier, not a secret. It is broadcast on the LAN, so a host that
+has seen it can claim to be that device. Favorites keep strangers and mistakes out, but they are not
+authentication. See "Security" under next steps.
 
 ---
 
@@ -113,9 +139,12 @@ $ADB shell input tap X Y                                             # drive it 
 $ADB logcat | grep -i airlynx
 ```
 
-- The emulator sits behind NAT, so broadcast discovery can't reach the Mac. Use the address field.
-- **Emulator to Mac:** send to `10.0.2.2`.
+- The emulator sits behind NAT, so broadcast discovery can't reach the Mac. Use "Send to an address".
+- **Emulator to Mac:** send to `10.0.2.2`. The Mac shows a request with **Add favorite**; accept it, then send again.
 - **Mac to emulator:** run `adb forward tcp:47900 tcp:47800`, then `airlynx send f --to 127.0.0.1:47900`.
+  The emulator shows a request with **Add favorite**; accept it, then send again.
+- Two profiles on one machine can test favorites with the CLI: `--config-dir a` and `--config-dir b`
+  (only one receiver can bind the ports at a time).
 
 ---
 
@@ -156,9 +185,11 @@ Rough priority order:
    (intent filter for `ACTION_SEND`/`ACTION_SEND_MULTIPLE`), which means moving from cargo-apk to Gradle,
    or to GameActivity with a small Java shim. This would also allow the Storage Access Framework
    instead of all-files access, which Play Store review usually rejects.
-4. **Security:** there is no encryption and no authentication, and any device on the LAN can push files.
-   Ideas: a pairing code or accept prompt on the receiver, and TLS with pinned self-signed certs.
-5. **Receiver UX:** an accept/decline prompt, a cancel button for incoming transfers, persisted history,
+4. **Security:** there is no encryption, and favorites are matched by an unauthenticated device id (see the trust
+   model above), so a host on the LAN that learns a favorite's id can impersonate it. Fix: a pairing step that
+   exchanges a secret or public key when two devices favorite each other (for example a short code shown on both
+   screens), then TLS with pinned self-signed certs.
+5. **Receiver UX:** a cancel button for incoming transfers, persisted history,
    and a notification on Android. A real foreground service (with a notification) is the robust fix for
    receiving while locked or backgrounded; it needs the Gradle/Java move from item 3.
 6. **Packaging:** app icons (both platforms), a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.

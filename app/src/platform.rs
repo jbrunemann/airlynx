@@ -15,6 +15,14 @@ mod desktop {
         name.strip_suffix(".local").unwrap_or(&name).to_string()
     }
 
+    /// Where the device id and favorites live. Shared with the CLI.
+    pub fn config_dir() -> PathBuf {
+        dirs::config_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("AirLynx")
+    }
+
     pub fn default_receive_dir() -> PathBuf {
         dirs::download_dir()
             .or_else(dirs::home_dir)

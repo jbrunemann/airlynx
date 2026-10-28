@@ -1,9 +1,11 @@
-//! AirLynx core: UDP discovery plus a small TCP file-transfer protocol.
+//! AirLynx core: UDP discovery, favorite devices, and a small TCP file-transfer protocol.
 
 pub mod discovery;
+pub mod identity;
 pub mod protocol;
 pub mod receive;
 pub mod send;
 
 pub use discovery::{Peer, discover};
+pub use identity::{DeviceId, Favorite, Favorites, Identity, Profile};
 pub use protocol::{DEFAULT_TCP_PORT, DISCOVERY_PORT, human_size};

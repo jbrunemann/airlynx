@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use crate::identity::Identity;
 use crate::protocol::*;
 
 #[derive(Debug, Clone)]
@@ -55,10 +56,12 @@ pub fn prepare(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Vec<Entry
         .collect()
 }
 
-/// Sends `entries` to `addr`. `on_progress` is called after every chunk;
-/// returning `ControlFlow::Break` cancels the transfer.
+/// Sends `entries` to `addr` as `me`. The receiver must have `me` as a favorite,
+/// otherwise this fails with `ErrorKind::PermissionDenied`. `on_progress` is
+/// called after every chunk; returning `ControlFlow::Break` cancels the transfer.
 pub fn send_files(
     addr: SocketAddr,
+    me: &Identity,
     entries: &[Entry],
     mut on_progress: impl FnMut(&Progress) -> ControlFlow<()>,
 ) -> io::Result<Report> {
@@ -67,8 +70,16 @@ pub fn send_files(
 
     stream.write_all(MAGIC)?;
     stream.write_all(&[VERSION])?;
-    if read_u8(&mut stream)? != STATUS_OK {
-        return Err(invalid("receiver rejected the handshake (version mismatch?)"));
+    write_hello(&mut stream, me)?;
+    match read_u8(&mut stream)? {
+        STATUS_OK => {}
+        STATUS_NOT_FAVORITE => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the receiver has not added this device as a favorite",
+            ));
+        }
+        _ => return Err(invalid("receiver rejected the handshake (version mismatch?)")),
     }
     stream.write_all(&(entries.len() as u32).to_be_bytes())?;
 

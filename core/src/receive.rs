@@ -10,6 +10,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::discovery;
+use crate::identity::{DeviceId, Favorites, Identity};
 use crate::protocol::*;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -21,12 +22,16 @@ const PROGRESS_STEP: u64 = 512 * 1024;
 pub struct ReceiverConfig {
     pub dir: PathBuf,
     pub port: u16,
-    pub name: String,
+    pub identity: Identity,
+    /// Only these devices may send. Shared, so changes apply to the running receiver.
+    pub favorites: Favorites,
 }
 
 /// Everything a receiver reports. `peer` is the sender's "ip:port".
 #[derive(Debug, Clone)]
 pub enum ReceiveEvent {
+    /// A device that is not a favorite tried to send. Nothing was accepted.
+    Refused { peer: String, id: DeviceId, name: String },
     Connected { peer: String, files: u32 },
     FileStarted { peer: String, name: String, size: u64 },
     FileProgress { peer: String, name: String, received: u64, size: u64 },
@@ -78,20 +83,28 @@ pub fn start(
     let udp = discovery::bind_responder()?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let responder = discovery::spawn_responder(udp, port, config.name.clone(), stop.clone());
+    let responder = discovery::spawn_responder(
+        udp,
+        port,
+        config.identity.clone(),
+        config.favorites.clone(),
+        stop.clone(),
+    );
 
     let on_event: Arc<dyn Fn(ReceiveEvent) + Send + Sync> = Arc::new(on_event);
     let accept_stop = stop.clone();
     let dir = config.dir;
+    let favorites = config.favorites;
     let acceptor = thread::spawn(move || {
         while !accept_stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     let dir = dir.clone();
                     let on_event = on_event.clone();
+                    let favorites = favorites.clone();
                     thread::spawn(move || {
                         let peer = addr.to_string();
-                        let result = handle_session(stream, &dir, &peer, &*on_event);
+                        let result = handle_session(stream, &dir, &peer, &favorites, &*on_event);
                         on_event(ReceiveEvent::SessionEnded {
                             peer,
                             error: result.err().map(|e| e.to_string()),
@@ -117,6 +130,7 @@ fn handle_session(
     mut stream: TcpStream,
     dir: &Path,
     peer: &str,
+    favorites: &Favorites,
     on_event: &(dyn Fn(ReceiveEvent) + Send + Sync),
 ) -> io::Result<()> {
     // Accepted sockets can inherit the listener's non-blocking mode.
@@ -129,6 +143,12 @@ fn handle_session(
     if &magic != MAGIC || version != VERSION {
         stream.write_all(&[STATUS_REJECTED])?;
         return Err(invalid(format!("bad handshake (version {version})")));
+    }
+    let sender = read_hello(&mut stream)?;
+    if !favorites.contains(sender.id) {
+        stream.write_all(&[STATUS_NOT_FAVORITE])?;
+        on_event(ReceiveEvent::Refused { peer: peer.into(), id: sender.id, name: sender.name });
+        return Ok(());
     }
     stream.write_all(&[STATUS_OK])?;
 
@@ -256,5 +276,57 @@ mod tests {
         assert_eq!(sanitize_name("photo.jpg").unwrap(), "photo.jpg");
         assert!(sanitize_name("..").is_err());
         assert!(sanitize_name("dir/").is_err());
+    }
+
+    use crate::identity::DeviceId;
+    use crate::send::{self, Entry};
+    use std::net::TcpListener;
+    use std::ops::ControlFlow;
+    use std::sync::Mutex;
+
+    /// Runs one receiver session on loopback and returns the sender's result
+    /// and the receiver's events.
+    fn loopback(favorites: &Favorites, sender: &Identity) -> (io::Result<send::Report>, Vec<ReceiveEvent>) {
+        let dir = std::env::temp_dir().join(format!("airlynx-recv-{}", DeviceId::random()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("hello.txt");
+        fs::write(&src, b"hello favorites").unwrap();
+        let entries = vec![Entry { path: src, name: "hello.txt".into(), size: 15 }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let server = {
+            let (favorites, events, dir) = (favorites.clone(), events.clone(), dir.join("in"));
+            fs::create_dir_all(&dir).unwrap();
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let sink = |e| events.lock().unwrap().push(e);
+                let _ = handle_session(stream, &dir, "test", &favorites, &sink);
+            })
+        };
+        let result = send::send_files(addr, sender, &entries, |_| ControlFlow::Continue(()));
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let events = std::mem::take(&mut *events.lock().unwrap());
+        (result, events)
+    }
+
+    #[test]
+    fn favorite_can_send() {
+        let me = Identity::new(DeviceId::random(), "Phone");
+        let favorites = Favorites::in_memory();
+        favorites.add(me.id, "Phone").unwrap();
+        let (result, events) = loopback(&favorites, &me);
+        assert_eq!(result.unwrap().sent, ["hello.txt"]);
+        assert!(events.iter().any(|e| matches!(e, ReceiveEvent::FileSaved { .. })));
+    }
+
+    #[test]
+    fn stranger_is_refused() {
+        let me = Identity::new(DeviceId::random(), "Phone");
+        let (result, events) = loopback(&Favorites::in_memory(), &me);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(matches!(&events[..], [ReceiveEvent::Refused { id, name, .. }] if *id == me.id && name == "Phone"));
     }
 }
