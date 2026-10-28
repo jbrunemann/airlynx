@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod identity;
 pub mod protocol;
 pub mod receive;
+pub mod secure;
 pub mod send;
 
 pub use discovery::{Peer, discover};

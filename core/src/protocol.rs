@@ -1,8 +1,11 @@
 //! Wire protocol shared by sender and receiver.
 //!
 //! Session (sender -> receiver, all integers big-endian):
-//!   "ALNX" | version: u8                      -> receiver replies one status byte
-//!                                               (only on a version mismatch, which ends the session)
+//!   "ALNX" | version: u8 | sender public key: [u8; 32]
+//!                                             -> receiver replies status u8 (rejected on a version
+//!                                               mismatch, which ends the session), then, if ok,
+//!                                               its public key [u8; 32]
+//!   Everything below is encrypted, see `secure`.
 //!   sender id: [u8; 16] | name len: u8 | name: UTF-8
 //!                                             -> receiver replies one status byte
 //!   file count: u32
@@ -15,7 +18,7 @@ use std::io::{self, Read, Write};
 use crate::identity::{DeviceId, Identity, clean_name};
 
 pub const MAGIC: &[u8; 4] = b"ALNX";
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 
 pub const DEFAULT_TCP_PORT: u16 = 47800;
 pub const DISCOVERY_PORT: u16 = 47801;

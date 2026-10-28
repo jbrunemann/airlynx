@@ -1,7 +1,7 @@
 # AirLynx
 
 Local-network file transfer between Android and macOS (and anything else that runs Rust).
-Devices find each other with UDP broadcast. Files go over TCP with a SHA-256 check per file.
+Devices find each other with UDP broadcast. Files go over TCP, encrypted, with a SHA-256 check per file.
 
 **Favorites:** each install has a random device id. A device only accepts files from devices it has
 added as favorites. When two devices have added each other (a mutual favorite), either one can send to
@@ -54,6 +54,7 @@ Cargo workspace (edition 2024, resolver 3):
 | `core/src/protocol.rs` | `airlynx-core` | Constants (ports, magic, status codes), big-endian read helpers, handshake hello, `human_size` |
 | `core/src/identity.rs` | | `DeviceId`, `Identity`, `Favorites` (shared, persisted, reloads when the file changes on disk), `Profile` (id + favorites in one directory) |
 | `core/src/discovery.rs` | | `discover()` broadcasts and collects `Peer`s (never including the caller); responder thread used by the receiver |
+| `core/src/secure.rs` | | `Ephemeral` X25519 key exchange and `SecureStream`, an encrypted `Read + Write` wrapper (ChaCha20-Poly1305 records) |
 | `core/src/send.rs` | | `prepare()` validates paths, `send_files()` streams them with a progress callback (`ControlFlow::Break` cancels), `resolve()` parses `host[:port]` |
 | `core/src/receive.rs` | | `start()` returns a `ReceiverHandle` (stops on `stop()`/drop) and emits `ReceiveEvent`s; refuses non-favorites; filename sanitizing and `name (1).ext` dedup |
 | `cli/src/main.rs` | `airlynx` | clap CLI: `send`, `receive`, `discover`, `favorite` |
@@ -84,7 +85,7 @@ A `favorites` line is `<id> kind:<desktop|mobile|unknown> <name>`; older lines w
 
 ---
 
-## Protocol (version 3)
+## Protocol (version 4)
 
 **Discovery** on UDP 47801. A device broadcasts `AIRLYNX_DISCOVER <id>` to `255.255.255.255` twice, where
 `<id>` is its 32-hex-digit device id. Every other running device replies
@@ -96,8 +97,10 @@ the asker as a favorite. The asker drops replies carrying its own id and de-dupl
 
 ```
 sender                                       receiver
-"ALNX" | version u8                    ->
-                                       <-    status u8   (2 rejected; sent only on a version mismatch, which ends the session)
+"ALNX" | version u8 | public key [u8;32] ->
+                                       <-    status u8   (0 ok, 2 rejected: version mismatch, ends the session)
+                                       <-    public key [u8;32]   (only after status 0)
+==== everything below is inside the encrypted stream ====
 sender id [u8;16] | name_len u8 | name ->
                                        <-    status u8   (0 ok, 3 sender is not a favorite)
 file count u32                         ->
@@ -105,6 +108,14 @@ per file:
   name_len u16 | name (UTF-8) | size u64 | data | sha256[32]  ->
                                        <-    status u8   (0 ok, 1 hash mismatch)
 ```
+
+**Encryption:** both sides make a throwaway X25519 key pair per session and swap public keys in the handshake.
+Each direction gets its own ChaCha20-Poly1305 key, `SHA-256("airlynx v4 " | label | shared secret | sender pub | receiver pub)`.
+After the handshake the stream is a series of records, `len u16 | ciphertext+tag`, with up to 16 KiB of plaintext each.
+The nonce is a per-direction record counter, so records can't be reordered, replayed or dropped unnoticed.
+Writes are buffered and flushed when a record fills, on `flush`, and before every read.
+This keeps file names, contents and device names out of packet captures and router logs. UDP discovery is **not**
+encrypted (it carries the device id, kind and name).
 
 The receiver writes each file to a hidden `.<name>.<pid>.<n>.part` file and renames it only
 after the hash matches. Names are reduced to their last path component, so they can't escape
@@ -114,7 +125,8 @@ Changing the wire format means bumping `VERSION` in `core/src/protocol.rs`.
 
 **Trust model:** the sender id is a plain identifier, not a secret. It is broadcast on the LAN, so a host that
 has seen it can claim to be that device. Favorites keep strangers and mistakes out, but they are not
-authentication. See "Security" under next steps.
+authentication. The key exchange is likewise unauthenticated: it stops anyone who only records traffic, but a host that
+actively sits in the middle of a connection could still read it. See "Security" under next steps.
 
 ---
 
@@ -198,10 +210,11 @@ Rough priority order:
    (intent filter for `ACTION_SEND`/`ACTION_SEND_MULTIPLE`), which means moving from cargo-apk to Gradle,
    or to GameActivity with a small Java shim. This would also allow the Storage Access Framework
    instead of all-files access, which Play Store review usually rejects.
-3. **Security:** there is no encryption, and favorites are matched by an unauthenticated device id (see the trust
-   model above), so a host on the LAN that learns a favorite's id can impersonate it. Fix: a pairing step that
-   exchanges a secret or public key when two devices favorite each other (for example a short code shown on both
-   screens), then TLS with pinned self-signed certs.
+3. **Security:** transfers are encrypted (v4) but not authenticated, and favorites are matched by an unauthenticated
+   device id (see the trust model above), so a host on the LAN that learns a favorite's id can impersonate it, and an
+   active man in the middle can read a session. Fix: a pairing step that exchanges a secret or public key when two
+   devices favorite each other (for example a short code shown on both screens), then use it to authenticate the
+   key exchange. Discovery packets are still plaintext.
 4. **Receiver UX:** a cancel button for incoming transfers, persisted history,
    and a notification when a file arrives.
 5. **Packaging:** a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.

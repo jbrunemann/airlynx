@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::discovery;
 use crate::identity::{DeviceId, Favorites, Identity};
 use crate::protocol::*;
+use crate::secure::Ephemeral;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -144,13 +145,22 @@ fn handle_session(
         stream.write_all(&[STATUS_REJECTED])?;
         return Err(invalid(format!("bad handshake (version {version})")));
     }
+    let mut peer_public = [0u8; 32];
+    stream.read_exact(&mut peer_public)?;
+    let ephemeral = Ephemeral::new()?;
+    stream.write_all(&[STATUS_OK])?;
+    stream.write_all(&ephemeral.public())?;
+    let mut stream = ephemeral.into_stream(stream, peer_public, false)?;
+
     let sender = read_hello(&mut stream)?;
     if !favorites.contains(sender.id) {
         stream.write_all(&[STATUS_NOT_FAVORITE])?;
+        stream.flush()?;
         on_event(ReceiveEvent::Refused { peer: peer.into(), id: sender.id, name: sender.name });
         return Ok(());
     }
     stream.write_all(&[STATUS_OK])?;
+    stream.flush()?;
 
     let count = read_u32(&mut stream)?;
     on_event(ReceiveEvent::Connected { peer: peer.into(), files: count });
@@ -187,10 +197,12 @@ fn handle_session(
             let final_path = unique_path(dir, &name);
             fs::rename(&tmp_path, &final_path)?;
             stream.write_all(&[STATUS_OK])?;
+            stream.flush()?;
             on_event(ReceiveEvent::FileSaved { peer: peer.into(), path: final_path, size });
         } else {
             let _ = fs::remove_file(&tmp_path);
             stream.write_all(&[STATUS_HASH_MISMATCH])?;
+            stream.flush()?;
             on_event(ReceiveEvent::FileRejected {
                 peer: peer.into(),
                 name,
@@ -204,7 +216,7 @@ fn handle_session(
 /// Streams `size` bytes into `path`, then reads the sender's hash.
 /// Returns (computed hash, sender hash).
 fn receive_file(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     path: &Path,
     size: u64,
     mut progress: impl FnMut(u64),

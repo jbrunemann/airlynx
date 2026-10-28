@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::identity::Identity;
 use crate::protocol::*;
+use crate::secure::Ephemeral;
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -70,8 +71,17 @@ pub fn send_files(
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
+    let ephemeral = Ephemeral::new()?;
     stream.write_all(MAGIC)?;
     stream.write_all(&[VERSION])?;
+    stream.write_all(&ephemeral.public())?;
+    if read_u8(&mut stream)? != STATUS_OK {
+        return Err(invalid("receiver rejected the handshake (version mismatch?)"));
+    }
+    let mut peer_public = [0u8; 32];
+    stream.read_exact(&mut peer_public)?;
+    let mut stream = ephemeral.into_stream(stream, peer_public, true)?;
+
     write_hello(&mut stream, me)?;
     match read_u8(&mut stream)? {
         STATUS_OK => {}
@@ -81,7 +91,7 @@ pub fn send_files(
                 "the receiver has not added this device as a favorite",
             ));
         }
-        _ => return Err(invalid("receiver rejected the handshake (version mismatch?)")),
+        _ => return Err(invalid("receiver rejected the handshake")),
     }
     stream.write_all(&(entries.len() as u32).to_be_bytes())?;
 
@@ -129,7 +139,7 @@ pub fn send_files(
 
 /// Writes the file body to `stream` and returns its SHA-256.
 fn stream_file(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     entry: &Entry,
     progress: &mut Progress,
     on_progress: &mut impl FnMut(&Progress) -> ControlFlow<()>,
