@@ -73,8 +73,11 @@ icon = "@mipmap/ic_launcher"
 name = "dev.airlynx.app.MainActivity"
 launch_mode = "singleTask"
 exported = true
-# Keep the NativeActivity alive across rotation/keyboard changes instead of restarting it.
-config_changes = "orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
+# Keep the NativeActivity alive across every configuration change instead of restarting it. A restart
+# makes Android destroy the activity while the native event loop is idle, and that teardown never
+# finishes (the app hangs and gets an ANR). Changes missing here that really happen: mcc/mnc (the SIM
+# registering, roaming), fontScale, locale. The list is every value Android defines.
+config_changes = "mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|layoutDirection|fontScale|density|colorMode|fontWeightAdjustment"
 orientation = "portrait"
 
 # "Share to AirLynx" from any app: one file, several files, or text.
