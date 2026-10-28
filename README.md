@@ -35,7 +35,8 @@ cargo run --release -p airlynx -- send a.jpg b.pdf --device Pixel   # or --to 19
 
 **Pairing in the app:** open AirLynx on both devices. Under **Nearby**, tap **Add favorite** on the other
 device, and do the same on the other device. The favorite then shows **Online**, and **Send** is enabled once
-files are chosen. If a device that is not a favorite tries to send, the receiver shows a request under
+files are chosen. Files the receiver confirms (hash verified) are removed from
+the list after a send. Files that failed verification, or a cancelled or failed send, stay in the list. If a device that is not a favorite tries to send, the receiver shows a request under
 **Receiving** with an **Add favorite** button, which also works when discovery cannot find the device.
 
 On Android, tap **Grant file access** and enable "All files access". The built-in

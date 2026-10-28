@@ -31,6 +31,8 @@ pub struct Progress {
 #[derive(Debug, Clone)]
 pub struct Report {
     pub sent: Vec<String>,
+    /// Source paths of the files in `sent`, in the same order.
+    pub sent_paths: Vec<PathBuf>,
     pub failed: Vec<String>,
     pub bytes: u64,
     pub elapsed: Duration,
@@ -95,6 +97,7 @@ pub fn send_files(
     };
     let mut report = Report {
         sent: Vec::new(),
+        sent_paths: Vec::new(),
         failed: Vec::new(),
         bytes: 0,
         elapsed: Duration::ZERO,
@@ -113,6 +116,7 @@ pub fn send_files(
             STATUS_OK => {
                 report.bytes += entry.size;
                 report.sent.push(entry.name.clone());
+                report.sent_paths.push(entry.path.clone());
             }
             STATUS_HASH_MISMATCH => report.failed.push(entry.name.clone()),
             other => return Err(invalid(format!("unexpected status {other}"))),

@@ -71,6 +71,8 @@ struct Shared {
     scan_error: Option<String>,
     send: SendStatus,
     send_to: String,
+    /// Files the receiver confirmed; the UI drops them from the send list.
+    delivered: Vec<PathBuf>,
     incoming: Vec<Incoming>,
     requests: Vec<Request>,
     log: Vec<LogLine>,
@@ -238,10 +240,15 @@ impl AirLynxApp {
                     ControlFlow::Continue(())
                 }
             });
-            shared.lock().unwrap().send = match result {
-                Ok(report) => SendStatus::Done(report),
+            let mut s = shared.lock().unwrap();
+            s.send = match result {
+                Ok(report) => {
+                    s.delivered.extend(report.sent_paths.iter().cloned());
+                    SendStatus::Done(report)
+                }
                 Err(e) => SendStatus::Failed(e.to_string()),
             };
+            drop(s);
             ctx.request_repaint();
         });
     }
@@ -283,6 +290,10 @@ impl AirLynxApp {
     /// Background upkeep: periodic scans, and on Android picking up a changed save folder
     /// once the user has granted file access.
     fn tick(&mut self, ctx: &egui::Context) {
+        let delivered = std::mem::take(&mut self.shared.lock().unwrap().delivered);
+        if !delivered.is_empty() {
+            self.files.retain(|e| !delivered.contains(&e.path));
+        }
         let scanning = self.shared.lock().unwrap().scanning;
         if !scanning && self.last_scan.elapsed() >= SCAN_INTERVAL {
             self.start_scan(ctx, false);
