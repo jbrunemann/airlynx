@@ -144,11 +144,71 @@ fn system_service<'a>(env: &mut JNIEnv<'a>, context: &JObject<'_>, name: &str) -
     .l()
 }
 
-/// Keeps the CPU and Wi-Fi radio awake so transfers survive the screen locking.
-/// Without this the device sleeps shortly after lock and incoming connections stall or time out.
+/// Intent for `ReceiveService` (app/java). Addressed by name because a native thread's class loader
+/// cannot see app classes, so `Class.forName` would fail here.
+fn receive_service_intent<'a>(env: &mut JNIEnv<'a>, activity: &JObject<'_>) -> jni::errors::Result<JObject<'a>> {
+    let package = env.call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
+    let class = env.new_string("dev.airlynx.app.ReceiveService")?;
+    let intent = env.new_object("android/content/Intent", "()V", &[])?;
+    env.call_method(
+        &intent,
+        "setClassName",
+        "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+        &[JValue::Object(&package), JValue::Object(&class)],
+    )?;
+    Ok(intent)
+}
+
+/// Android 13+ hides notifications, including the one a foreground service must show, until the user allows them.
+fn request_notification_permission(env: &mut JNIEnv<'_>, activity: &JObject<'_>) -> jni::errors::Result<()> {
+    let permission = env.new_string("android.permission.POST_NOTIFICATIONS")?;
+    let state = env
+        .call_method(activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[JValue::Object(&permission)])?
+        .i()?;
+    if state == 0 {
+        return Ok(());
+    }
+    let list = env.new_object_array(1, "java/lang/String", &permission)?;
+    env.call_method(
+        activity,
+        "requestPermissions",
+        "([Ljava/lang/String;I)V",
+        &[JValue::Object(&list), JValue::Int(1)],
+    )?;
+    Ok(())
+}
+
+/// Starts or stops the foreground service that keeps the process running in the background.
+/// Wake and Wi-Fi locks alone do not: once the app is backgrounded, Android can freeze it or cut its
+/// network access (Doze ignores partial wake locks), so a locked phone would stop answering senders.
+fn set_receive_service(on: bool) {
+    with_env(|env, activity| {
+        let intent = receive_service_intent(env, activity)?;
+        if on {
+            if let Err(e) = request_notification_permission(env, activity) {
+                log::warn!("could not request notification permission: {e}");
+                let _ = env.exception_clear();
+            }
+            env.call_method(
+                activity,
+                "startForegroundService",
+                "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+                &[JValue::Object(&intent)],
+            )?;
+        } else {
+            env.call_method(activity, "stopService", "(Landroid/content/Intent;)Z", &[JValue::Object(&intent)])?;
+        }
+        Ok(())
+    });
+}
+
+/// Keeps the app able to receive with the screen locked: a foreground service (so the process is not
+/// frozen or cut off from the network), plus a CPU wake lock and Wi-Fi lock (so the radio stays awake
+/// and incoming connections do not stall).
 pub fn set_keep_awake(on: bool) {
     let mut held = RECEIVE_LOCKS.lock().unwrap();
     if !on {
+        set_receive_service(false);
         for lock in held.drain(..) {
             with_env(|env, _| {
                 if env.call_method(&lock, "isHeld", "()Z", &[])?.z()? {
@@ -162,6 +222,7 @@ pub fn set_keep_awake(on: bool) {
     if !held.is_empty() {
         return;
     }
+    set_receive_service(true);
     with_env(|env, activity| {
         let context = env
             .call_method(activity, "getApplicationContext", "()Landroid/content/Context;", &[])?

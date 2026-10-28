@@ -29,6 +29,7 @@ winit = { version = "0.30.13", features = ["android-native-activity"] }
 [package.metadata.android]
 package = "dev.airlynx.app"
 apk_name = "AirLynx"
+resources = "res"
 build_targets = ["aarch64-linux-android"]
 
 [package.metadata.android.sdk]
@@ -53,8 +54,18 @@ name = "android.permission.WAKE_LOCK"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
+[[package.metadata.android.uses_permission]]
+name = "android.permission.FOREGROUND_SERVICE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.POST_NOTIFICATIONS"
+
 [package.metadata.android.application]
 label = "AirLynx"
+icon = "@mipmap/ic_launcher"
 
 [package.metadata.android.application.activity]
 exported = true

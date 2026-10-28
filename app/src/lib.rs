@@ -22,4 +22,6 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
     if let Err(e) = eframe::run_native("AirLynx", options, Box::new(|cc| Ok(Box::new(AirLynxApp::new(cc))))) {
         log::error!("eframe exited with error: {e}");
     }
+    // The app (and its receiver) is gone, so the "ready to receive" notification must go too.
+    android::set_keep_awake(false);
 }
