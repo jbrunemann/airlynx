@@ -144,8 +144,9 @@ $ADB shell input tap X Y                                             # drive it 
 $ADB logcat | grep -i airlynx
 ```
 
-- The emulator sits behind NAT, so broadcast discovery can't reach the Mac. Use "Send to an address".
-- **Emulator to Mac:** send to `10.0.2.2`. The Mac shows a request with **Add favorite**; accept it, then send again.
+- The emulator sits behind NAT, so broadcast discovery can't reach the Mac. The app has no manual address entry
+  (see the icebox), so test the emulator against the CLI.
+- **Emulator to Mac:** not possible from the app without an address field. The emulator can only be reached from the Mac.
 - **Mac to emulator:** run `adb forward tcp:47900 tcp:47800`, then `airlynx send f --to 127.0.0.1:47900`.
   The emulator shows a request with **Add favorite**; accept it, then send again.
 - Two profiles on one machine can test favorites with the CLI: `--config-dir a` and `--config-dir b`
@@ -191,17 +192,23 @@ Rough priority order:
 1. **Test on a real phone and Mac on the same Wi-Fi**, especially discovery. Sending to `255.255.255.255`
    may pick the wrong interface on multi-homed Macs. A fallback would be to broadcast per interface
    (subnet-directed), or to switch to mDNS/Bonjour.
-2. **The soft keyboard covers the Send button.** Scroll the focused field into view, or move Send above the address field.
-3. **Android share target:** "Share to AirLynx" from other apps needs a Java/Kotlin activity
+2. **Android share target:** "Share to AirLynx" from other apps needs a Java/Kotlin activity
    (intent filter for `ACTION_SEND`/`ACTION_SEND_MULTIPLE`), which means moving from cargo-apk to Gradle,
    or to GameActivity with a small Java shim. This would also allow the Storage Access Framework
    instead of all-files access, which Play Store review usually rejects.
-4. **Security:** there is no encryption, and favorites are matched by an unauthenticated device id (see the trust
+3. **Security:** there is no encryption, and favorites are matched by an unauthenticated device id (see the trust
    model above), so a host on the LAN that learns a favorite's id can impersonate it. Fix: a pairing step that
    exchanges a secret or public key when two devices favorite each other (for example a short code shown on both
    screens), then TLS with pinned self-signed certs.
-5. **Receiver UX:** a cancel button for incoming transfers, persisted history,
+4. **Receiver UX:** a cancel button for incoming transfers, persisted history,
    and a notification when a file arrives.
-6. **Packaging:** a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.
-7. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
+5. **Packaging:** a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.
+6. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
    and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
+
+### Icebox
+
+- **Send to an address:** a collapsible section in the app with a host/IP field and its own Send button, for devices
+  that discovery cannot find (for example the emulator behind NAT). It resolved the target with `send::resolve` and
+  reused `start_send`. It was removed from the UI, and the CLI still has `send --to`. If it comes back, move Send above
+  the field, because the soft keyboard covers it on Android.

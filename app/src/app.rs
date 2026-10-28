@@ -106,7 +106,6 @@ pub struct AirLynxApp {
     notice: Option<String>,
     files: Vec<Entry>,
     file_error: Option<String>,
-    manual_target: String,
     receive_dir: PathBuf,
     receiver: Option<ReceiverHandle>,
     receiver_error: Option<String>,
@@ -144,7 +143,6 @@ impl AirLynxApp {
             notice,
             files: Vec::new(),
             file_error: None,
-            manual_target: String::new(),
             receive_dir: platform::default_receive_dir(),
             receiver: None,
             receiver_error: None,
@@ -463,30 +461,6 @@ impl AirLynxApp {
         }
     }
 
-    fn address_section(&mut self, ui: &mut egui::Ui, sending: bool, actions: &mut Actions) {
-        ui.collapsing("Send to an address", |ui| {
-            ui.label(
-                RichText::new("For devices that cannot be found automatically. The other device must still have you as a favorite.")
-                    .weak(),
-            );
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.manual_target)
-                        .hint_text("192.168.1.20")
-                        .desired_width(180.0),
-                );
-                let target = self.manual_target.trim();
-                let ready = !sending && !self.files.is_empty() && !target.is_empty();
-                if ui.add_enabled(ready, egui::Button::new("Send")).clicked() {
-                    match send::resolve(target) {
-                        Ok(addr) => actions.send_to = Some((addr, target.to_string())),
-                        Err(e) => self.file_error = Some(e.to_string()),
-                    }
-                }
-            });
-        });
-    }
-
     fn send_status(&mut self, ui: &mut egui::Ui, s: &Shared) {
         match &s.send {
             SendStatus::Idle => {}
@@ -684,7 +658,6 @@ impl eframe::App for AirLynxApp {
                 self.favorites_section(ui, &shared, sending, &mut actions);
                 self.send_status(ui, &shared);
                 self.nearby_section(ui, &shared, &mut actions);
-                self.address_section(ui, sending, &mut actions);
                 self.receive_section(ui, &ctx, &shared, &mut actions);
             });
             self.apply(&ctx, actions);
