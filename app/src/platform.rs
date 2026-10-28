@@ -38,6 +38,9 @@ mod desktop {
     /// Android only: runs a foreground service and holds wake/Wi-Fi locks so receiving works with the screen locked.
     pub fn set_keep_awake(_on: bool) {}
 
+    /// Android only: deletes the copy made of a file shared from another app.
+    pub fn discard_copy(_path: &Path) {}
+
     pub fn pick_files() -> Vec<PathBuf> {
         rfd::FileDialog::new().pick_files().unwrap_or_default()
     }

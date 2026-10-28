@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig};
-use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, DeviceKind, Identity, Peer, Profile, discover, human_size, send};
+use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, DeviceKind, Identity, Peer, Profile, human_size, scan, send};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -101,11 +101,17 @@ fn run(cli: Cli) -> io::Result<()> {
     match cli.command {
         Command::Receive { dir, port, name } => {
             let me = name.map_or(me.clone(), |n| Identity::new(me.id, &n).with_kind(me.kind));
-            run_receive(ReceiverConfig { dir, port, identity: me, favorites: profile.favorites })
+            run_receive(ReceiverConfig {
+                dir,
+                port,
+                identity: me,
+                favorites: profile.favorites,
+                poll_interval: receive::DEFAULT_POLL_INTERVAL,
+            })
         }
         Command::Send { files, device, to, wait } => run_send(&profile, &me, files, device, to, Duration::from_secs(wait)),
         Command::Discover { wait } => {
-            let peers = discover(&me, Duration::from_secs(wait))?;
+            let peers = scan(&me, &profile.favorites, Duration::from_secs(wait))?;
             if peers.is_empty() {
                 println!("No devices found");
             }
@@ -133,7 +139,7 @@ fn run(cli: Cli) -> io::Result<()> {
                 println!("Added \"{name}\" ({}) as a favorite", id.short());
                 return Ok(());
             }
-            let peers = discover(&me, Duration::from_secs(wait))?;
+            let peers = scan(&me, &profile.favorites, Duration::from_secs(wait))?;
             let peer = pick(&peers, &device, |p| (p.id, &p.name))?;
             profile.favorites.add(peer.id, &peer.name, peer.kind)?;
             println!("Added \"{}\" ({}) as a favorite", peer.name, peer.id.short());
@@ -239,7 +245,7 @@ fn run_send(
 /// Finds a favorite on the network: the named one, or the only one online.
 fn pick_receiver(profile: &Profile, me: &Identity, device: Option<&str>, wait: Duration) -> io::Result<SocketAddr> {
     println!("Looking for favorites...");
-    let favorites: Vec<Peer> = discover(me, wait)?
+    let favorites: Vec<Peer> = scan(me, &profile.favorites, wait)?
         .into_iter()
         .filter(|p| profile.favorites.contains(p.id))
         .collect();

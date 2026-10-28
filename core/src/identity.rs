@@ -4,11 +4,13 @@
 //! devices in its favorites, so two devices can exchange files in both
 //! directions once each has added the other.
 
+use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -157,6 +159,10 @@ pub struct Favorite {
 
 /// The set of trusted devices. Cloning shares the same list, so the receiver
 /// sees changes the UI makes immediately. Changes are written to disk.
+///
+/// Next to the list sits an address cache, the last IP each favorite was seen at. Discovery asks
+/// those addresses directly, so a favorite is still found when broadcast and mDNS fail. It is kept
+/// in its own file (`addresses`), because it changes on every network move and the list should not.
 #[derive(Debug, Clone)]
 pub struct Favorites {
     inner: Arc<Mutex<FavoritesInner>>,
@@ -168,20 +174,23 @@ struct FavoritesInner {
     list: Vec<Favorite>,
     /// Modification time of the file as last read or written, to notice edits by other processes.
     mtime: Option<SystemTime>,
+    /// Last known address per favorite. Loaded once; not shared between processes.
+    addresses: HashMap<DeviceId, IpAddr>,
 }
 
 impl Favorites {
     /// Loads the list from `path`; a missing file is an empty list. The list reloads
     /// itself when another process (the CLI, say) changes the file.
     pub fn load(path: PathBuf) -> io::Result<Self> {
-        let mut inner = FavoritesInner { path: Some(path), list: Vec::new(), mtime: None };
+        let mut inner = FavoritesInner { path: Some(path), list: Vec::new(), mtime: None, addresses: HashMap::new() };
         inner.reload()?;
+        inner.addresses = inner.load_addresses();
         Ok(Self { inner: Arc::new(Mutex::new(inner)) })
     }
 
     /// A list that is never saved.
     pub fn in_memory() -> Self {
-        let inner = FavoritesInner { path: None, list: Vec::new(), mtime: None };
+        let inner = FavoritesInner { path: None, list: Vec::new(), mtime: None, addresses: HashMap::new() };
         Self { inner: Arc::new(Mutex::new(inner)) }
     }
 
@@ -221,7 +230,29 @@ impl Favorites {
         let mut inner = self.inner.lock().unwrap();
         inner.refresh();
         inner.list.retain(|f| f.id != id);
+        if inner.addresses.remove(&id).is_some() {
+            inner.save_addresses();
+        }
         inner.save()
+    }
+
+    /// Where each favorite was last seen, for asking it directly.
+    pub fn known_addresses(&self) -> Vec<IpAddr> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.refresh();
+        let mut ips: Vec<IpAddr> = inner.list.iter().filter_map(|f| inner.addresses.get(&f.id).copied()).collect();
+        ips.sort();
+        ips.dedup();
+        ips
+    }
+
+    /// Notes that favorite `id` answered from `ip`. Ignores devices that are not favorites. A failed
+    /// save only loses the cache.
+    pub fn remember_address(&self, id: DeviceId, ip: IpAddr) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.list.iter().any(|f| f.id == id) && inner.addresses.insert(id, ip) != Some(ip) {
+            inner.save_addresses();
+        }
     }
 }
 
@@ -260,6 +291,27 @@ impl FavoritesInner {
         if self.path.is_some() && self.file_mtime() != self.mtime {
             let _ = self.reload();
         }
+    }
+
+    fn addresses_path(&self) -> Option<PathBuf> {
+        Some(self.path.as_ref()?.with_file_name("addresses"))
+    }
+
+    /// Lines of `<id> <ip>`; anything unreadable is skipped.
+    fn load_addresses(&self) -> HashMap<DeviceId, IpAddr> {
+        let Some(text) = self.addresses_path().and_then(|p| fs::read_to_string(p).ok()) else { return HashMap::new() };
+        text.lines()
+            .filter_map(|line| {
+                let (id, ip) = line.split_once(' ')?;
+                Some((id.parse().ok()?, ip.trim().parse().ok()?))
+            })
+            .collect()
+    }
+
+    fn save_addresses(&self) {
+        let Some(path) = self.addresses_path() else { return };
+        let text: String = self.addresses.iter().map(|(id, ip)| format!("{id} {ip}\n")).collect();
+        let _ = write_atomic(&path, &text);
     }
 
     fn save(&mut self) -> io::Result<()> {
@@ -354,6 +406,27 @@ mod tests {
 
         second.favorites.remove(friend).unwrap();
         assert!(!Profile::load(&dir).unwrap().favorites.contains(friend));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn addresses_are_cached_for_favorites_only() {
+        let dir = std::env::temp_dir().join(format!("airlynx-test-{}", DeviceId::random()));
+        let favorites = Profile::load(&dir).unwrap().favorites;
+        let (friend, stranger) = (DeviceId::random(), DeviceId::random());
+        let (a, b): (IpAddr, IpAddr) = ("10.11.46.85".parse().unwrap(), "10.11.19.114".parse().unwrap());
+        favorites.add(friend, "Pixel", DeviceKind::Mobile).unwrap();
+        favorites.remember_address(friend, a);
+        favorites.remember_address(stranger, b);
+        assert_eq!(favorites.known_addresses(), vec![a]);
+
+        // It survives a restart, follows a device that moved, and goes away with the favorite.
+        let reloaded = Profile::load(&dir).unwrap().favorites;
+        assert_eq!(reloaded.known_addresses(), vec![a]);
+        reloaded.remember_address(friend, b);
+        assert_eq!(Profile::load(&dir).unwrap().favorites.known_addresses(), vec![b]);
+        reloaded.remove(friend).unwrap();
+        assert!(Profile::load(&dir).unwrap().favorites.known_addresses().is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

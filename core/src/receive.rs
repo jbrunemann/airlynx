@@ -11,13 +11,20 @@ use sha2::{Digest, Sha256};
 
 use crate::discovery;
 use crate::identity::{DeviceId, Favorites, Identity};
+use crate::mdns::{self, Advertisement};
 use crate::protocol::*;
 use crate::secure::Ephemeral;
+use crate::stats;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Emit a progress event roughly every this many bytes.
 const PROGRESS_STEP: u64 = 512 * 1024;
+
+/// How long the accept loop sleeps between checks. The discovery loop waits twice as long for a packet.
+/// Both only bound how quickly the receiver notices it was stopped, apart from the accept loop also
+/// delaying a new connection by up to this long. Longer means fewer wakeups, which saves battery.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ReceiverConfig {
@@ -26,6 +33,7 @@ pub struct ReceiverConfig {
     pub identity: Identity,
     /// Only these devices may send. Shared, so changes apply to the running receiver.
     pub favorites: Favorites,
+    pub poll_interval: Duration,
 }
 
 /// Everything a receiver reports. `peer` is the sender's "ip:port".
@@ -47,6 +55,8 @@ pub struct ReceiverHandle {
     port: u16,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Keeps the mDNS registration alive (none if mDNS is unavailable).
+    _advertisement: Option<Advertisement>,
 }
 
 impl ReceiverHandle {
@@ -81,7 +91,7 @@ pub fn start(
     let listener = TcpListener::bind(("0.0.0.0", config.port))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
-    let udp = discovery::bind_responder()?;
+    let udp = discovery::bind_responder(config.poll_interval * 2)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let responder = discovery::spawn_responder(
@@ -92,14 +102,19 @@ pub fn start(
         stop.clone(),
     );
 
+    let advertisement = mdns::advertise(&config.identity, port);
+
     let on_event: Arc<dyn Fn(ReceiveEvent) + Send + Sync> = Arc::new(on_event);
     let accept_stop = stop.clone();
     let dir = config.dir;
     let favorites = config.favorites;
+    let poll_interval = config.poll_interval;
     let acceptor = thread::spawn(move || {
         while !accept_stop.load(Ordering::Relaxed) {
+            stats::accept_poll();
             match listener.accept() {
                 Ok((stream, addr)) => {
+                    stats::session();
                     let dir = dir.clone();
                     let on_event = on_event.clone();
                     let favorites = favorites.clone();
@@ -113,9 +128,9 @@ pub fn start(
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(poll_interval);
                 }
-                Err(_) => thread::sleep(Duration::from_millis(100)),
+                Err(_) => thread::sleep(poll_interval),
             }
         }
     });
@@ -124,6 +139,7 @@ pub fn start(
         port,
         stop,
         threads: vec![responder, acceptor],
+        _advertisement: advertisement,
     })
 }
 
@@ -137,6 +153,7 @@ fn handle_session(
     // Accepted sockets can inherit the listener's non-blocking mode.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
 
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic)?;
@@ -161,6 +178,9 @@ fn handle_session(
     }
     stream.write_all(&[STATUS_OK])?;
     stream.flush()?;
+    if let Some(ip) = peer_ip {
+        favorites.remember_address(sender.id, ip);
+    }
 
     let count = read_u32(&mut stream)?;
     on_event(ReceiveEvent::Connected { peer: peer.into(), files: count });

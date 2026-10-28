@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig, ReceiverHandle};
 use airlynx_core::send::{self, Entry, Progress, Report};
-use airlynx_core::{DEFAULT_TCP_PORT, DeviceId, DeviceKind, Favorites, Identity, Peer, Profile, discover, human_size};
+use airlynx_core::{DEFAULT_TCP_PORT, DeviceId, DeviceKind, Favorites, Identity, Peer, Profile, human_size, scan};
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, vec2};
 
 use crate::platform;
@@ -165,6 +165,8 @@ pub struct AirLynxApp {
     seen_received: usize,
     files: Vec<Entry>,
     file_error: Option<String>,
+    /// Files from other apps (Android share target) still being copied.
+    sharing: usize,
     receive_dir: PathBuf,
     receiver: Option<ReceiverHandle>,
     receiver_error: Option<String>,
@@ -173,6 +175,8 @@ pub struct AirLynxApp {
     last_dir_check: Instant,
     #[cfg(target_os = "android")]
     browser: Option<crate::browser::FileBrowser>,
+    #[cfg(target_os = "android")]
+    diag: crate::diag::Diagnostics,
 }
 
 impl AirLynxApp {
@@ -200,6 +204,7 @@ impl AirLynxApp {
             seen_received: 0,
             files: Vec::new(),
             file_error: None,
+            sharing: 0,
             receive_dir: platform::default_receive_dir(),
             receiver: None,
             receiver_error: None,
@@ -208,6 +213,8 @@ impl AirLynxApp {
             last_dir_check: Instant::now(),
             #[cfg(target_os = "android")]
             browser: None,
+            #[cfg(target_os = "android")]
+            diag: crate::diag::Diagnostics::new(),
         };
         app.start_receiver(&cc.egui_ctx);
         app.start_scan(&cc.egui_ctx, true);
@@ -239,7 +246,7 @@ impl AirLynxApp {
         }
         self.last_scan = Instant::now();
         thread::spawn(move || {
-            let result = discover(&identity, Duration::from_millis(1500));
+            let result = scan(&identity, &favorites, Duration::from_millis(1500));
             let mut s = shared.lock().unwrap();
             s.scanning = false;
             s.scan_visible = false;
@@ -315,12 +322,21 @@ impl AirLynxApp {
         #[cfg(target_os = "android")]
         {
             self.receive_dir = platform::default_receive_dir();
+            if !self.diag.experiments().receiver {
+                self.receiver_error = Some("Switched off under Diagnostics".into());
+                return;
+            }
         }
+        #[cfg(target_os = "android")]
+        let poll_interval = self.diag.experiments().poll_interval();
+        #[cfg(not(target_os = "android"))]
+        let poll_interval = receive::DEFAULT_POLL_INTERVAL;
         let config = ReceiverConfig {
             dir: self.receive_dir.clone(),
             port: DEFAULT_TCP_PORT,
             identity: self.identity.clone(),
             favorites: self.favorites.clone(),
+            poll_interval,
         };
         let shared = self.shared.clone();
         let ctx = ctx.clone();
@@ -350,7 +366,10 @@ impl AirLynxApp {
         let delivered = std::mem::take(&mut self.shared.lock().unwrap().delivered);
         if !delivered.is_empty() {
             self.files.retain(|e| !delivered.contains(&e.path));
+            delivered.iter().for_each(|path| platform::discard_copy(path));
         }
+        #[cfg(target_os = "android")]
+        self.take_shared_files();
         let scanning = self.shared.lock().unwrap().scanning;
         if !scanning && self.last_scan.elapsed() >= SCAN_INTERVAL {
             self.start_scan(ctx, false);
@@ -363,7 +382,23 @@ impl AirLynxApp {
                 self.restart_receiver(ctx);
             }
         }
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Shared files appear as soon as they are copied, so look more often while that runs.
+        ctx.request_repaint_after(if self.sharing > 0 { Duration::from_millis(250) } else { Duration::from_secs(1) });
+    }
+
+    /// Files other apps shared to AirLynx join the send list, and the Send page comes to the front.
+    #[cfg(target_os = "android")]
+    fn take_shared_files(&mut self) {
+        let shared = platform::take_shared();
+        self.sharing = shared.preparing;
+        if let Some(error) = shared.error {
+            self.file_error = Some(error);
+        }
+        if !shared.ready.is_empty() {
+            self.add_files(shared.ready);
+            self.tab = Tab::Send;
+            self.browser = None;
+        }
     }
 
     /// The Android file browser replaces the whole screen, so the tabs are hidden while it is open.
@@ -601,10 +636,13 @@ impl AirLynxApp {
                 }
             });
             if let Some(i) = remove {
-                self.files.remove(i);
+                platform::discard_copy(&self.files.remove(i).path);
             }
         }
 
+        if self.sharing > 0 {
+            theme::sub(ui, &format!("Preparing {} shared file{}...", self.sharing, plural(self.sharing)));
+        }
         if let Some(err) = &self.file_error {
             ui.label(RichText::new(err).color(p.err));
         }
@@ -655,7 +693,7 @@ impl AirLynxApp {
             #[cfg(not(target_os = "android"))]
             let _ = browse;
             if self.files.len() > 1 && theme::button(ui, Kind::Text, None, "Clear all", !sending).clicked() {
-                self.files.clear();
+                self.files.drain(..).for_each(|e| platform::discard_copy(&e.path));
             }
         });
     }
@@ -991,6 +1029,9 @@ impl AirLynxApp {
             });
         }
 
+        #[cfg(target_os = "android")]
+        self.diagnostics_section(ui, ctx);
+
         ui.add_space(6.0);
         ui.label(
             RichText::new(format!(
@@ -1000,6 +1041,83 @@ impl AirLynxApp {
             .small()
             .color(p.sub),
         );
+    }
+}
+
+#[cfg(target_os = "android")]
+impl AirLynxApp {
+    /// Battery and wakeup numbers for judging what listening costs. The screen being on skews them,
+    /// so the log toggle exists to measure with the phone locked and read the result afterwards.
+    fn diagnostics_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = pal(ui);
+        theme::section(ui, "Diagnostics", None);
+        self.diag.refresh();
+        let mut experiments = self.diag.experiments();
+        theme::card(ui, None, |ui| {
+            theme::sub(
+                ui,
+                "Counted since the baseline. With the screen on the numbers are inflated: switch on the log, \
+                 lock the phone for an hour or more, then send the log file to another device.",
+            );
+            ui.add_space(4.0);
+            for (label, value) in self.diag.rows() {
+                ui.scope(|ui| {
+                    // Rows are as tall as a control by default, which leaves big gaps between lines of text.
+                    ui.spacing_mut().interact_size.y = 0.0;
+                    ui.spacing_mut().item_spacing = vec2(6.0, 2.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(label).size(13.0).color(p.sub));
+                        ui.label(RichText::new(value).size(13.0));
+                    });
+                });
+            }
+            ui.add_space(4.0);
+            let mut logging = self.diag.logging();
+            if ui.checkbox(&mut logging, "Write a log line every minute").changed() {
+                let path = self.receive_dir.join("airlynx-diag.log");
+                self.diag.set_logging(logging, &path);
+            }
+            if let Some(err) = &self.diag.log_error {
+                ui.label(RichText::new(err).size(13.0).color(p.err));
+            }
+            if let Some(path) = self.diag.log_path() {
+                theme::sub(ui, "Log file, pick it with Browse files on the Send tab");
+                ui.label(RichText::new(path.display().to_string()).monospace().size(12.0));
+            }
+            if theme::button(ui, Kind::Secondary, None, "Reset baseline", true).clicked() {
+                self.diag.reset();
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("Experiments").family(theme::bold()).size(14.5));
+            theme::sub(
+                ui,
+                "Switch one thing off at a time and run it for 30 minutes or more with the screen off. \
+                 Each change restarts the receiver and the baseline, and is recorded in the log.",
+            );
+            ui.checkbox(&mut experiments.receiver, "Receiver on (off is the control run)");
+            ui.add_enabled_ui(experiments.receiver, |ui| {
+                ui.checkbox(&mut experiments.wake_lock, "CPU wake lock");
+                ui.checkbox(&mut experiments.wifi_lock, "Wi-Fi high-performance lock");
+                ui.checkbox(&mut experiments.multicast_lock, "Multicast lock");
+                ui.checkbox(&mut experiments.slow_poll, "Slow polling (1 s instead of 0.1 s)");
+            });
+        });
+        if experiments != self.diag.experiments() {
+            self.apply_experiments(ctx, experiments);
+        }
+    }
+
+    /// Restarts the receiver with its locks as `experiments` says. The old locks have to go first,
+    /// because `set_keep_awake` takes whatever `set_keep` last chose.
+    fn apply_experiments(&mut self, ctx: &egui::Context, experiments: crate::diag::Experiments) {
+        self.diag.set_experiments(experiments);
+        self.receiver = None;
+        platform::set_keep_awake(false);
+        crate::android::set_keep(experiments.keep());
+        self.start_receiver(ctx);
+        // Stopping the old receiver takes up to a couple of seconds, which should not count.
+        self.diag.reset();
     }
 }
 
