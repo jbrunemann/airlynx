@@ -9,34 +9,52 @@ use std::time::{Duration, Instant};
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig, ReceiverHandle};
 use airlynx_core::send::{self, Entry, Progress, Report};
 use airlynx_core::{DEFAULT_TCP_PORT, DeviceId, DeviceKind, Favorites, Identity, Peer, Profile, discover, human_size};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, vec2};
 
 use crate::platform;
-
-const OK_COLOR: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
-const ERR_COLOR: Color32 = Color32::from_rgb(0xe5, 0x53, 0x4b);
-const WARN_COLOR: Color32 = Color32::from_rgb(0xd2, 0x99, 0x22);
+use crate::theme::{self, Icon, Kind, Tint, pal};
 
 /// How often the network is scanned in the background.
 const SCAN_INTERVAL: Duration = Duration::from_secs(6);
 /// A device counts as online until it has been silent this long, so one lost
 /// UDP packet does not make a favorite flicker offline.
 const PEER_TTL: Duration = Duration::from_secs(20);
+/// Windows at least this wide get a sidebar and two columns, narrower ones a tab bar.
+const WIDE_WIDTH: f32 = 720.0;
+const BADGE_COLOR: Color32 = Color32::from_rgb(0xC6, 0x28, 0x28);
 
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Tab {
     #[default]
-    Transfer,
-    History,
+    Send,
+    Received,
+    Settings,
 }
 
 impl Tab {
-    const ALL: [Tab; 2] = [Tab::Transfer, Tab::History];
+    const ALL: [Tab; 3] = [Tab::Send, Tab::Received, Tab::Settings];
 
     fn label(self) -> &'static str {
         match self {
-            Tab::Transfer => "Transfer",
-            Tab::History => "History",
+            Tab::Send => "Send",
+            Tab::Received => "Received",
+            Tab::Settings => "Settings",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Send => "Send files",
+            Tab::Received => "Received",
+            Tab::Settings => "Settings",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Tab::Send => Icon::Send,
+            Tab::Received => Icon::Inbox,
+            Tab::Settings => Icon::Sliders,
         }
     }
 }
@@ -54,15 +72,23 @@ enum SendStatus {
 #[derive(Clone)]
 struct Incoming {
     peer: String,
+    from: String,
     name: String,
     received: u64,
     size: u64,
 }
 
+/// One finished (or failed) incoming file, newest last.
 #[derive(Clone)]
-struct LogLine {
+struct Received {
     ok: bool,
-    text: String,
+    name: String,
+    size: u64,
+    from: String,
+    /// Why it failed; empty when `ok`.
+    note: String,
+    path: Option<PathBuf>,
+    at: Instant,
 }
 
 #[derive(Clone)]
@@ -89,11 +115,13 @@ struct Shared {
     scan_error: Option<String>,
     send: SendStatus,
     send_to: String,
+    send_target: Option<DeviceId>,
+    send_started: Option<Instant>,
     /// Files the receiver confirmed; the UI drops them from the send list.
     delivered: Vec<PathBuf>,
     incoming: Vec<Incoming>,
     requests: Vec<Request>,
-    log: Vec<LogLine>,
+    received: Vec<Received>,
 }
 
 impl Shared {
@@ -103,16 +131,26 @@ impl Shared {
             .find(|p| p.peer.id == id && p.seen.elapsed() < PEER_TTL)
             .map(|p| &p.peer)
     }
+
+    /// The name of the device behind an "ip:port" connection, if discovery has seen it.
+    fn name_for(&self, peer: &str) -> String {
+        let ip = peer.rsplit_once(':').map_or(peer, |(ip, _)| ip).trim_matches(['[', ']']);
+        self.peers
+            .iter()
+            .find(|p| p.peer.addr.ip().to_string() == ip)
+            .map_or_else(|| ip.to_string(), |p| p.peer.name.clone())
+    }
 }
 
 /// What the user asked for during one frame. Applied after drawing so the
 /// widgets never borrow the app mutably.
 #[derive(Default)]
 struct Actions {
-    send_to: Option<(SocketAddr, String)>,
+    send_to: Option<(SocketAddr, String, DeviceId)>,
     add_favorite: Option<(DeviceId, String, DeviceKind)>,
     remove_favorite: Option<DeviceId>,
     dismiss_request: Option<DeviceId>,
+    dismiss_send: bool,
     scan: bool,
 }
 
@@ -123,6 +161,8 @@ pub struct AirLynxApp {
     favorites: Favorites,
     notice: Option<String>,
     tab: Tab,
+    /// How many received files the user has already looked at, for the tab badge.
+    seen_received: usize,
     files: Vec<Entry>,
     file_error: Option<String>,
     receive_dir: PathBuf,
@@ -137,13 +177,9 @@ pub struct AirLynxApp {
 
 impl AirLynxApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            style.spacing.button_padding = egui::vec2(10.0, 6.0);
-            if cfg!(target_os = "android") {
-                style.spacing.interact_size.y = 36.0;
-            }
-        });
+        theme::install(&cc.egui_ctx);
+        #[cfg(target_os = "android")]
+        sync_theme(&cc.egui_ctx);
 
         let (profile, notice) = match Profile::load(&platform::config_dir()) {
             Ok(profile) => (profile, None),
@@ -161,6 +197,7 @@ impl AirLynxApp {
             favorites: profile.favorites,
             notice,
             tab: Tab::default(),
+            seen_received: 0,
             files: Vec::new(),
             file_error: None,
             receive_dir: platform::default_receive_dir(),
@@ -227,7 +264,7 @@ impl AirLynxApp {
         });
     }
 
-    fn start_send(&mut self, ctx: &egui::Context, addr: SocketAddr, target_name: String) {
+    fn start_send(&mut self, ctx: &egui::Context, addr: SocketAddr, target_name: String, target: DeviceId) {
         let entries = self.files.clone();
         let shared = self.shared.clone();
         let cancel = self.cancel.clone();
@@ -237,6 +274,8 @@ impl AirLynxApp {
         {
             let mut s = shared.lock().unwrap();
             s.send_to = target_name;
+            s.send_target = Some(target);
+            s.send_started = Some(Instant::now());
             s.send = SendStatus::Sending(Progress {
                 file_index: 0,
                 file_count: entries.len(),
@@ -306,7 +345,7 @@ impl AirLynxApp {
     }
 
     /// Background upkeep: periodic scans, and on Android picking up a changed save folder
-    /// once the user has granted file access.
+    /// once the user has granted file access, and a changed light/dark setting.
     fn tick(&mut self, ctx: &egui::Context) {
         let delivered = std::mem::take(&mut self.shared.lock().unwrap().delivered);
         if !delivered.is_empty() {
@@ -319,6 +358,7 @@ impl AirLynxApp {
         #[cfg(target_os = "android")]
         if self.last_dir_check.elapsed() >= Duration::from_secs(2) {
             self.last_dir_check = Instant::now();
+            sync_theme(ctx);
             if self.receiver.is_some() && platform::default_receive_dir() != self.receive_dir {
                 self.restart_receiver(ctx);
             }
@@ -335,8 +375,8 @@ impl AirLynxApp {
     }
 
     fn apply(&mut self, ctx: &egui::Context, actions: Actions) {
-        if let Some((addr, name)) = actions.send_to {
-            self.start_send(ctx, addr, name);
+        if let Some((addr, name, id)) = actions.send_to {
+            self.start_send(ctx, addr, name, id);
         }
         if let Some((id, name, kind)) = actions.add_favorite {
             self.set_notice(self.favorites.add(id, &name, kind));
@@ -347,6 +387,9 @@ impl AirLynxApp {
         }
         if let Some(id) = actions.dismiss_request {
             self.shared.lock().unwrap().requests.retain(|r| r.id != id);
+        }
+        if actions.dismiss_send {
+            self.shared.lock().unwrap().send = SendStatus::Idle;
         }
         if actions.scan {
             let mut s = self.shared.lock().unwrap();
@@ -364,106 +407,293 @@ impl AirLynxApp {
         self.notice = result.err().map(|e| format!("Favorites cannot be saved: {e}"));
     }
 
-    fn files_section(&mut self, ui: &mut egui::Ui, sending: bool) {
-        section(ui, "Files to send");
-        #[cfg(target_os = "android")]
-        if platform::has_all_files_access() {
-            if ui.add_enabled(!sending, egui::Button::new("Browse files…")).clicked() {
-                self.browser = Some(crate::browser::FileBrowser::new(platform::storage_root()));
-            }
+    fn unseen(&self, s: &Shared) -> usize {
+        s.received.len().saturating_sub(self.seen_received) + s.requests.len()
+    }
+
+    // ---- chrome -------------------------------------------------------------------------------
+
+    fn receiving_pill(&self, ui: &mut egui::Ui) {
+        let p = pal(ui);
+        if self.receiver.is_some() {
+            theme::pill(ui, p.ok_soft, p.ok, p.ok, "Ready to receive");
         } else {
-            ui.label("AirLynx needs access to your files to send them.");
-            if ui.button("Grant file access").clicked() {
-                platform::request_all_files_access();
-            }
+            theme::pill(ui, p.err_soft, p.err, p.err, "Not receiving");
         }
+    }
+
+    /// Phone layout: logo and status on top.
+    fn header(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = pal(ui);
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(16, 8)))
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                #[cfg(target_os = "android")]
+                ui.add_space(platform::status_bar_height_px() / ctx.pixels_per_point());
+                #[cfg(not(target_os = "android"))]
+                let _ = ctx;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    theme::logo(ui, 34.0);
+                    ui.label(RichText::new("AirLynx").family(theme::bold()).size(20.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.receiving_pill(ui));
+                });
+            });
+    }
+
+    /// Phone layout: three tabs along the bottom.
+    fn tab_bar(&mut self, ui: &mut egui::Ui, unseen: usize) {
+        let p = pal(ui);
+        #[cfg(target_os = "android")]
+        let inset = platform::navigation_bar_height_px() / ui.ctx().pixels_per_point();
         #[cfg(not(target_os = "android"))]
-        {
-            let add_clicked = ui
-                .horizontal(|ui| {
-                    let clicked = ui.add_enabled(!sending, egui::Button::new("Add files…")).clicked();
-                    ui.label(RichText::new("or drop files onto this window").weak());
-                    clicked
-                })
-                .inner;
-            if add_clicked {
-                self.add_files(platform::pick_files());
+        let inset = 0.0;
+        egui::Panel::bottom("tabs")
+            .exact_size(72.0 + inset)
+            .frame(egui::Frame::new().fill(p.surface))
+            .show(ui, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                let width = rect.width() / Tab::ALL.len() as f32;
+                for (i, tab) in Tab::ALL.into_iter().enumerate() {
+                    let cell = egui::Rect::from_min_size(rect.min + vec2(width * i as f32, 0.0), vec2(width, 72.0));
+                    let response = ui.interact(cell, ui.scope_id().with(("tab", i)), Sense::click());
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tab.label()));
+                    let active = self.tab == tab;
+                    let color = if active { p.accent_text } else { p.sub };
+                    let pill = egui::Rect::from_center_size(egui::pos2(cell.center().x, cell.top() + 25.0), vec2(56.0, 30.0));
+                    if active {
+                        ui.painter().rect_filled(pill, egui::CornerRadius::same(15), p.accent_soft);
+                    }
+                    tab.icon().paint(ui.painter(), egui::Rect::from_center_size(pill.center(), egui::Vec2::splat(22.0)), color, 1.9);
+                    let font = egui::FontId::new(13.0, if active { theme::bold() } else { egui::FontFamily::Proportional });
+                    theme::text_at(ui, egui::pos2(cell.center().x, cell.top() + 54.0), egui::Align2::CENTER_CENTER, tab.label(), font, color);
+                    if tab == Tab::Received && unseen > 0 {
+                        badge(ui, egui::pos2(pill.right() - 6.0, pill.top() + 1.0), unseen);
+                    }
+                    if response.clicked() {
+                        self.tab = tab;
+                    }
+                }
+            });
+    }
+
+    /// Desktop layout: logo, navigation and receive status on the left.
+    fn sidebar(&mut self, ui: &mut egui::Ui, unseen: usize) {
+        let p = pal(ui);
+        egui::Panel::left("nav")
+            .exact_size(200.0)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin::symmetric(12, 20)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.add_space(8.0);
+                    theme::logo(ui, 34.0);
+                    ui.label(RichText::new("AirLynx").family(theme::bold()).size(20.0));
+                });
+                ui.add_space(14.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for tab in Tab::ALL {
+                    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tab.label()));
+                    let active = self.tab == tab;
+                    let color = if active { p.accent_text } else { p.sub };
+                    if active || response.hovered() {
+                        let fill = if active { p.accent_soft } else { p.bg };
+                        ui.painter().rect_filled(rect, egui::CornerRadius::same(10), fill);
+                    }
+                    tab.icon().paint(ui.painter(), egui::Rect::from_center_size(rect.left_center() + vec2(22.0, 0.0), egui::Vec2::splat(20.0)), color, 1.9);
+                    let font = egui::FontId::new(15.0, if active { theme::bold() } else { egui::FontFamily::Proportional });
+                    theme::text_at(ui, rect.left_center() + vec2(42.0, 0.0), egui::Align2::LEFT_CENTER, tab.label(), font, color);
+                    if tab == Tab::Received && unseen > 0 {
+                        badge(ui, rect.right_center() - vec2(20.0, 0.0), unseen);
+                    }
+                    if response.clicked() {
+                        self.tab = tab;
+                    }
+                }
+                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    egui::Frame::new()
+                        .fill(p.bg)
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            let (dot, text, label) = if self.receiver.is_some() {
+                                (p.ok, p.ok, "Ready to receive")
+                            } else {
+                                (p.err, p.err, "Not receiving")
+                            };
+                            theme::status_line(ui, dot, text, label);
+                            ui.add(egui::Label::new(RichText::new(format!("Visible as {}", self.identity.name)).small().color(p.sub)).truncate());
+                        });
+                });
+            });
+    }
+
+    // ---- send page ----------------------------------------------------------------------------
+
+    fn send_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Shared, wide: bool, actions: &mut Actions) {
+        let sending = matches!(s.send, SendStatus::Sending(_));
+        send_result(ui, s, actions);
+        if wide {
+            ui.spacing_mut().item_spacing.x = 24.0;
+            ui.columns(2, |cols| {
+                for col in cols.iter_mut() {
+                    col.spacing_mut().item_spacing.x = 8.0;
+                }
+                self.files_section(&mut cols[0], ctx, s, sending);
+                self.devices_section(&mut cols[1], s, sending, actions);
+            });
+        } else {
+            self.files_section(ui, ctx, s, sending);
+            self.devices_section(ui, s, sending, actions);
+        }
+    }
+
+    fn files_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Shared, sending: bool) {
+        let p = pal(ui);
+        let total: u64 = self.files.iter().map(|e| e.size).sum();
+        let summary = (!self.files.is_empty())
+            .then(|| format!("{} file{}, {}", self.files.len(), plural(self.files.len()), human_size(total)));
+        theme::section(ui, "Files", summary.as_deref());
+
+        if !self.files.is_empty() {
+            let progress_index = match &s.send {
+                SendStatus::Sending(p) => Some(p.file_index),
+                _ => None,
+            };
+            let mut remove = None;
+            theme::card(ui, None, |ui| {
+                for (i, entry) in self.files.iter().enumerate() {
+                    if i > 0 {
+                        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                        ui.painter().rect_filled(line, 0.0, p.line);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        theme::tile(ui, Icon::File, 36.0, Tint::Accent);
+                        let right_w = 76.0;
+                        let mid_w = (ui.available_width() - right_w - 12.0).max(40.0);
+                        ui.allocate_ui_with_layout(vec2(mid_w, 36.0), Layout::top_down(Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.add(egui::Label::new(RichText::new(&entry.name).size(14.5)).truncate());
+                            theme::sub(ui, &human_size(entry.size));
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| match progress_index {
+                            None => {
+                                if theme::icon_button(ui, Icon::Close, &format!("Remove {}", entry.name)).clicked() {
+                                    remove = Some(i);
+                                }
+                            }
+                            Some(current) => {
+                                let (text, color) = match i.cmp(&current) {
+                                    std::cmp::Ordering::Less => ("Sent", p.ok),
+                                    std::cmp::Ordering::Equal => ("Sending", p.accent_text),
+                                    std::cmp::Ordering::Greater => ("Waiting", p.sub),
+                                };
+                                ui.label(RichText::new(text).size(13.0).family(theme::bold()).color(color));
+                            }
+                        });
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                self.files.remove(i);
             }
         }
 
         if let Some(err) = &self.file_error {
-            ui.colored_label(ERR_COLOR, err);
+            ui.label(RichText::new(err).color(p.err));
         }
-        let mut remove = None;
-        for (i, entry) in self.files.iter().enumerate() {
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!sending, egui::Button::new("Remove").small()).clicked() {
-                    remove = Some(i);
+
+        #[cfg(target_os = "android")]
+        {
+            let _ = ctx;
+            if platform::has_all_files_access() {
+                self.file_actions(ui, sending, |app| {
+                    app.browser = Some(crate::browser::FileBrowser::new(platform::storage_root()));
+                });
+            } else {
+                theme::card(ui, None, |ui| {
+                    ui.label(RichText::new("AirLynx needs access to your files to send them.").color(p.sub));
+                    if theme::button(ui, Kind::Primary, None, "Grant file access", true).clicked() {
+                        platform::request_all_files_access();
+                    }
+                });
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+            let color = if hovering { p.accent_text } else { p.off };
+            let zone = ui.vertical_centered(|ui| {
+                ui.set_width(ui.available_width());
+                ui.add_space(12.0);
+                ui.label(RichText::new(if hovering { "Release to add" } else { "Drop files here" }).color(p.sub));
+                if theme::button(ui, Kind::Secondary, Some(Icon::Plus), "Add files", !sending).clicked() {
+                    self.add_files(platform::pick_files());
                 }
-                ui.label(&entry.name);
-                ui.label(RichText::new(human_size(entry.size)).weak());
+                ui.add_space(12.0);
             });
-        }
-        if let Some(i) = remove {
-            self.files.remove(i);
-        }
-        if self.files.len() > 1 && ui.add_enabled(!sending, egui::Button::new("Clear all")).clicked() {
-            self.files.clear();
+            theme::dashed_rect(ui, zone.response.rect, color);
+            if self.files.len() > 1 && !sending {
+                self.file_actions(ui, sending, |_| {});
+            }
         }
     }
 
-    fn favorites_section(&self, ui: &mut egui::Ui, s: &Shared, sending: bool, actions: &mut Actions) {
-        section(ui, "Favorites");
+    /// The row under the file list: on Android the browse button, plus Clear all.
+    fn file_actions(&mut self, ui: &mut egui::Ui, sending: bool, browse: impl FnOnce(&mut Self)) {
+        ui.horizontal(|ui| {
+            #[cfg(target_os = "android")]
+            if theme::button(ui, Kind::Secondary, Some(Icon::Plus), "Browse files", !sending).clicked() {
+                browse(self);
+            }
+            #[cfg(not(target_os = "android"))]
+            let _ = browse;
+            if self.files.len() > 1 && theme::button(ui, Kind::Text, None, "Clear all", !sending).clicked() {
+                self.files.clear();
+            }
+        });
+    }
+
+    fn devices_section(&self, ui: &mut egui::Ui, s: &Shared, sending: bool, actions: &mut Actions) {
+        let p = pal(ui);
+        theme::section(ui, "Send to", Some("Favorites"));
         let favorites = self.favorites.list();
         if favorites.is_empty() {
             ui.label(
                 RichText::new(
-                    "No favorites yet. Add a device from Nearby below. Once both devices have added \
-                     each other, they can send files to each other any time.",
+                    "No favorites yet. Add a device below. Once both devices have added each other, \
+                     they can send files to each other any time.",
                 )
-                .weak(),
+                .size(13.0)
+                .color(p.sub),
             );
         } else if self.files.is_empty() {
-            ui.label(RichText::new("Choose files above, then press Send next to a device.").weak());
+            theme::sub(ui, "Choose files, then press Send next to a device.");
         }
         for fav in &favorites {
-            let live = s.online(fav.id);
-            ui.horizontal(|ui| {
-                device_icon(ui, live.map_or(fav.kind, |p| p.kind));
-                ui.label(RichText::new(&fav.name).strong());
-                ui.label(RichText::new(fav.id.short()).weak().small());
-            });
-            ui.horizontal(|ui| {
-                match live {
-                    None => ui.label(RichText::new("Offline").weak()),
-                    Some(p) if p.mutual => ui.colored_label(OK_COLOR, "Online"),
-                    Some(_) => ui.colored_label(WARN_COLOR, "Online, has not added you yet"),
-                };
-                let can_send = !sending && !self.files.is_empty() && live.is_some_and(|p| p.mutual);
-                if ui.add_enabled(can_send, egui::Button::new("Send")).clicked()
-                    && let Some(p) = live
-                {
-                    actions.send_to = Some((p.addr, fav.name.clone()));
-                }
-                if ui.add(egui::Button::new("Unfavorite").small()).clicked() {
-                    actions.remove_favorite = Some(fav.id);
-                }
-            });
+            self.device_card(ui, s, fav, sending, actions);
         }
-    }
 
-    fn nearby_section(&self, ui: &mut egui::Ui, s: &Shared, actions: &mut Actions) {
-        section(ui, "Nearby");
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.add_enabled(!s.scan_visible, egui::Button::new("Scan now")).clicked() {
-                actions.scan = true;
-            }
-            if s.scan_visible {
-                ui.spinner();
-            }
+            ui.label(RichText::new("Add a device").family(theme::bold()).size(16.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if s.scan_visible {
+                    ui.add_space(10.0);
+                    ui.spinner();
+                } else if theme::icon_button(ui, Icon::Refresh, "Scan again").clicked() {
+                    actions.scan = true;
+                }
+            });
         });
         if let Some(err) = &s.scan_error {
-            ui.colored_label(ERR_COLOR, format!("Scan failed: {err}"));
+            ui.label(RichText::new(format!("Scan failed: {err}")).color(p.err));
         }
         let mut any = false;
         for seen in &s.peers {
@@ -472,132 +702,377 @@ impl AirLynxApp {
                 continue;
             }
             any = true;
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&peer.name).strong());
-                ui.label(RichText::new(peer.id.short()).weak().small());
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Add favorite").clicked() {
-                    actions.add_favorite = Some((peer.id, peer.name.clone(), peer.kind));
-                }
-                if peer.mutual {
-                    ui.label(RichText::new("has added you").weak());
-                }
+            theme::card(ui, None, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    theme::tile(ui, device_icon(peer.kind), 40.0, Tint::Muted);
+                    let mid_w = (ui.available_width() - 70.0 - 12.0).max(40.0);
+                    ui.allocate_ui_with_layout(vec2(mid_w, 40.0), Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add(egui::Label::new(RichText::new(&peer.name).family(theme::bold()).size(15.0)).truncate());
+                        theme::sub(ui, if peer.mutual { "Nearby, has added you" } else { "Nearby, not a favorite" });
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::button(ui, Kind::Secondary, None, "Add", true).clicked() {
+                            actions.add_favorite = Some((peer.id, peer.name.clone(), peer.kind));
+                        }
+                    });
+                });
             });
         }
         if !any && s.scanned_once && !s.scan_visible {
-            ui.label(RichText::new("No new devices found. Is AirLynx open on the other device?").weak());
+            ui.label(RichText::new("No new devices found. Is AirLynx open on the other device?").size(13.0).color(p.sub));
         }
     }
 
-    fn send_status(&mut self, ui: &mut egui::Ui, s: &Shared) {
-        match &s.send {
-            SendStatus::Idle => {}
-            SendStatus::Sending(p) => {
-                section(ui, &format!("Sending to {}", s.send_to));
-                let fraction = if p.total_size == 0 { 1.0 } else { p.total_sent as f32 / p.total_size as f32 };
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .text(format!("{} ({}/{})", p.file_name, p.file_index + 1, p.file_count)),
-                );
-                if ui.button("Cancel").clicked() {
-                    self.cancel.store(true, Ordering::Relaxed);
-                }
+    fn device_card(&self, ui: &mut egui::Ui, s: &Shared, fav: &airlynx_core::Favorite, sending: bool, actions: &mut Actions) {
+        let p = pal(ui);
+        let live = s.online(fav.id);
+        let kind = live.map_or(fav.kind, |peer| peer.kind);
+        let target = match &s.send {
+            SendStatus::Sending(progress) if s.send_target == Some(fav.id) => Some(progress),
+            _ => None,
+        };
+        let border = target.map(|_| p.accent);
+        theme::card(ui, border, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                theme::tile(ui, device_icon(kind), 44.0, if live.is_some() { Tint::Accent } else { Tint::Muted });
+                let mid_w = (ui.available_width() - 92.0 - 12.0).max(40.0);
+                ui.allocate_ui_with_layout(vec2(mid_w, 44.0), Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let name_color = if live.is_some() { p.text } else { p.sub };
+                    ui.add(egui::Label::new(RichText::new(&fav.name).family(theme::bold()).size(15.5).color(name_color)).truncate());
+                    if let Some(progress) = target {
+                        ui.label(
+                            RichText::new(format!("Sending, file {} of {}", progress.file_index + 1, progress.file_count))
+                                .size(13.0)
+                                .color(p.accent_text),
+                        );
+                    } else {
+                        match live {
+                            None => theme::status_line(ui, p.off, p.sub, "Offline"),
+                            Some(peer) if peer.mutual => theme::status_line(ui, p.ok, p.ok, "Online"),
+                            Some(_) => theme::status_line(ui, p.warn, p.warn, "Has not added you yet"),
+                        }
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if target.is_some() {
+                        if theme::button(ui, Kind::Secondary, None, "Cancel", true).clicked() {
+                            self.cancel.store(true, Ordering::Relaxed);
+                        }
+                    } else {
+                        let can_send = !sending && !self.files.is_empty() && live.is_some_and(|peer| peer.mutual);
+                        if theme::button(ui, Kind::Primary, Some(Icon::Send), "Send", can_send).clicked()
+                            && let Some(peer) = live
+                        {
+                            actions.send_to = Some((peer.addr, fav.name.clone(), fav.id));
+                        }
+                    }
+                });
+            });
+            if let Some(progress) = target {
+                ui.add_space(4.0);
+                let fraction = if progress.total_size == 0 { 1.0 } else { progress.total_sent as f32 / progress.total_size as f32 };
+                theme::progress(ui, fraction);
+                let rate = s
+                    .send_started
+                    .map(|t| t.elapsed().as_secs_f64().max(0.001))
+                    .map_or(0, |secs| (progress.total_sent as f64 / secs) as u64);
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(RichText::new(&progress.file_name).small().color(p.sub)).truncate());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        theme::sub(
+                            ui,
+                            &format!("{} of {}, {}/s", human_size(progress.total_sent), human_size(progress.total_size), human_size(rate)),
+                        );
+                    });
+                });
             }
-            SendStatus::Done(r) => {
-                let secs = r.elapsed.as_secs_f64().max(0.001);
-                ui.colored_label(
-                    OK_COLOR,
-                    format!(
-                        "Sent {} file(s) to {}, {} in {secs:.1}s ({}/s)",
-                        r.sent.len(),
-                        s.send_to,
-                        human_size(r.bytes),
-                        human_size((r.bytes as f64 / secs) as u64)
-                    ),
-                );
-                if !r.failed.is_empty() {
-                    ui.colored_label(ERR_COLOR, format!("Failed verification: {}", r.failed.join(", ")));
-                }
-            }
-            SendStatus::Failed(e) => {
-                ui.colored_label(ERR_COLOR, format!("Send to {} failed: {e}", s.send_to));
-            }
-        }
+        });
     }
 
-    fn receive_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Shared, actions: &mut Actions) {
-        section(ui, "Receiving");
-        if let Some(handle) = &self.receiver {
-            ui.colored_label(
-                OK_COLOR,
-                format!(
-                    "Ready. Visible as \"{}\" on port {}. Files from favorites are accepted automatically.",
-                    self.identity.name,
-                    handle.port()
-                ),
-            );
-        } else {
-            if let Some(err) = &self.receiver_error {
-                ui.colored_label(ERR_COLOR, err);
-            }
-            if ui.button("Retry").clicked() {
-                self.restart_receiver(ctx);
-            }
+    // ---- received page ------------------------------------------------------------------------
+
+    fn received_page(&mut self, ui: &mut egui::Ui, s: &Shared, actions: &mut Actions) {
+        let p = pal(ui);
+
+        for inc in &s.incoming {
+            theme::card(ui, Some(p.accent), |ui| {
+                let fraction = if inc.size == 0 { 1.0 } else { inc.received as f32 / inc.size as f32 };
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    theme::tile(ui, Icon::Download, 36.0, Tint::Accent);
+                    let mid_w = (ui.available_width() - 50.0 - 12.0).max(40.0);
+                    ui.allocate_ui_with_layout(vec2(mid_w, 36.0), Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add(egui::Label::new(RichText::new(&inc.name).size(14.5)).truncate());
+                        theme::sub(ui, &format!("Incoming from {}", inc.from));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{}%", (fraction * 100.0) as u32)).family(theme::bold()).color(p.accent_text));
+                    });
+                });
+                ui.add_space(2.0);
+                theme::progress(ui, fraction);
+            });
         }
 
         for req in &s.requests {
-            ui.label(format!("{} tried to send you files, but is not a favorite.", req.name));
-            ui.horizontal(|ui| {
-                if ui.button("Add favorite").clicked() {
-                    actions.add_favorite = Some((req.id, req.name.clone(), DeviceKind::Unknown));
+            theme::banner(ui, p.warn_soft, |ui| {
+                ui.label(RichText::new(format!("{} tried to send you files", req.name)).family(theme::bold()).color(p.warn));
+                ui.label(RichText::new("Add it as a favorite to accept files from it.").size(13.0).color(p.warn));
+                ui.horizontal(|ui| {
+                    if theme::button(ui, Kind::Primary, None, "Add favorite", true).clicked() {
+                        actions.add_favorite = Some((req.id, req.name.clone(), DeviceKind::Unknown));
+                    }
+                    if theme::button(ui, Kind::Text, None, "Dismiss", true).clicked() {
+                        actions.dismiss_request = Some(req.id);
+                    }
+                });
+            });
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("History").family(theme::bold()).size(16.0));
+            #[cfg(not(target_os = "android"))]
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::button(ui, Kind::Text, Some(Icon::Folder), "Open folder", true).clicked() {
+                    let _ = std::fs::create_dir_all(&self.receive_dir);
+                    platform::open_folder(&self.receive_dir);
                 }
-                if ui.button("Dismiss").clicked() {
-                    actions.dismiss_request = Some(req.id);
+            });
+        });
+
+        if s.received.is_empty() {
+            ui.label(RichText::new("Nothing received yet.").size(13.0).color(p.sub));
+            return;
+        }
+        theme::card(ui, None, |ui| {
+            for (i, item) in s.received.iter().rev().enumerate() {
+                if i > 0 {
+                    let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                    ui.painter().rect_filled(line, 0.0, p.line);
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    if item.ok {
+                        theme::tile(ui, Icon::File, 36.0, Tint::Accent);
+                    } else {
+                        theme::tile(ui, Icon::Warning, 36.0, Tint::Error);
+                    }
+                    let open = cfg!(not(target_os = "android")) && item.ok && item.path.is_some();
+                    let mid_w = (ui.available_width() - if open { 60.0 } else { 0.0 } - 12.0).max(40.0);
+                    ui.allocate_ui_with_layout(vec2(mid_w, 36.0), Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add(egui::Label::new(RichText::new(&item.name).size(14.5)).truncate());
+                        let ago = ago(item.at.elapsed());
+                        let (detail, color) = if item.ok {
+                            (format!("{} from {}, {ago}", human_size(item.size), item.from), p.sub)
+                        } else {
+                            (format!("{}, from {}, {ago}", item.note, item.from), p.err)
+                        };
+                        ui.add(egui::Label::new(RichText::new(detail).small().color(color)).truncate());
+                    });
+                    #[cfg(not(target_os = "android"))]
+                    if open {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::button(ui, Kind::Text, None, "Open", true).clicked()
+                                && let Some(path) = &item.path
+                            {
+                                // The opener launches files as well as folders.
+                                platform::open_folder(path);
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    // ---- settings page ------------------------------------------------------------------------
+
+    fn settings_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, actions: &mut Actions) {
+        let p = pal(ui);
+
+        theme::section(ui, "This device", None);
+        theme::card(ui, None, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                theme::tile(ui, device_icon(platform::device_kind()), 44.0, Tint::Accent);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new(&self.identity.name).family(theme::bold()).size(15.5));
+                    theme::sub(ui, &format!("Visible to nearby devices, id {}", self.identity.id.short()));
+                });
+            });
+        });
+
+        theme::section(ui, "Receiving", None);
+        theme::card(ui, None, |ui| {
+            if self.receiver.is_some() {
+                ui.label(RichText::new("Always on while the app is open").family(theme::bold()).size(14.5));
+                ui.label(
+                    RichText::new(format!(
+                        "Files from favorites are accepted automatically on port {}.",
+                        self.receiver.as_ref().map_or(DEFAULT_TCP_PORT, |r| r.port())
+                    ))
+                    .size(13.0)
+                    .color(p.sub),
+                );
+            } else {
+                if let Some(err) = &self.receiver_error {
+                    ui.label(RichText::new(err).color(p.err));
+                }
+                if theme::button(ui, Kind::Primary, None, "Retry", true).clicked() {
+                    self.restart_receiver(ctx);
+                }
+            }
+            ui.add_space(4.0);
+            theme::sub(ui, "Saved to");
+            ui.label(RichText::new(self.receive_dir.display().to_string()).monospace());
+            #[cfg(not(target_os = "android"))]
+            ui.horizontal(|ui| {
+                if theme::button(ui, Kind::Secondary, None, "Change…", true).clicked()
+                    && let Some(dir) = platform::pick_folder()
+                {
+                    self.receive_dir = dir;
+                    self.restart_receiver(ctx);
+                }
+                if theme::button(ui, Kind::Secondary, Some(Icon::Folder), "Open folder", true).clicked() {
+                    let _ = std::fs::create_dir_all(&self.receive_dir);
+                    platform::open_folder(&self.receive_dir);
+                }
+            });
+            #[cfg(target_os = "android")]
+            {
+                ui.add_space(4.0);
+                ui.label(RichText::new("File access").family(theme::bold()).size(14.5));
+                if platform::has_all_files_access() {
+                    ui.label(RichText::new("Allowed").size(13.0).family(theme::bold()).color(p.ok));
+                } else {
+                    ui.label(RichText::new("Grant file access to save into Download/AirLynx instead.").size(13.0).color(p.sub));
+                    if theme::button(ui, Kind::Secondary, None, "Grant file access", true).clicked() {
+                        platform::request_all_files_access();
+                    }
+                }
+            }
+        });
+
+        theme::section(ui, "Favorites", None);
+        let favorites = self.favorites.list();
+        if favorites.is_empty() {
+            ui.label(RichText::new("No favorites yet.").size(13.0).color(p.sub));
+        } else {
+            theme::card(ui, None, |ui| {
+                for (i, fav) in favorites.iter().enumerate() {
+                    if i > 0 {
+                        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                        ui.painter().rect_filled(line, 0.0, p.line);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        theme::tile(ui, device_icon(fav.kind), 36.0, Tint::Muted);
+                        let mid_w = (ui.available_width() - 90.0 - 12.0).max(40.0);
+                        ui.allocate_ui_with_layout(vec2(mid_w, 36.0), Layout::top_down(Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.add(egui::Label::new(RichText::new(&fav.name).size(14.5)).truncate());
+                            theme::sub(ui, &fav.id.short());
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::button(ui, Kind::Danger, None, "Remove", true).clicked() {
+                                actions.remove_favorite = Some(fav.id);
+                            }
+                        });
+                    });
                 }
             });
         }
 
-        ui.label(RichText::new("Saved to").weak());
-        ui.label(RichText::new(self.receive_dir.display().to_string()).monospace());
-        #[cfg(not(target_os = "android"))]
-        ui.horizontal(|ui| {
-            if ui.button("Change…").clicked()
-                && let Some(dir) = platform::pick_folder()
-            {
-                self.receive_dir = dir;
-                self.restart_receiver(ctx);
-            }
-            if ui.button("Open folder").clicked() {
-                let _ = std::fs::create_dir_all(&self.receive_dir);
-                platform::open_folder(&self.receive_dir);
-            }
-        });
-        #[cfg(target_os = "android")]
-        if !platform::has_all_files_access() {
-            ui.label(RichText::new("Grant file access to save into Download/AirLynx instead.").weak());
-            if ui.button("Grant file access").clicked() {
-                platform::request_all_files_access();
-            }
-        }
-
-        if !s.incoming.is_empty() {
-            section(ui, "Incoming");
-            for inc in &s.incoming {
-                let fraction = if inc.size == 0 { 1.0 } else { inc.received as f32 / inc.size as f32 };
-                ui.label(format!("{} from {}", inc.name, inc.peer));
-                ui.add(egui::ProgressBar::new(fraction).show_percentage());
-            }
-        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "AirLynx {}. Transfers are encrypted. Your device name is visible to everyone on the same network.",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .small()
+            .color(p.sub),
+        );
     }
+}
 
-    fn history_tab(&self, ui: &mut egui::Ui, s: &Shared) {
-        if s.log.is_empty() {
-            ui.label(RichText::new("Nothing received yet.").weak());
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+fn ago(elapsed: Duration) -> String {
+    match elapsed.as_secs() {
+        0..10 => "just now".into(),
+        10..60 => format!("{}s ago", elapsed.as_secs()),
+        60..3600 => format!("{} min ago", elapsed.as_secs() / 60),
+        secs => format!("{} h ago", secs / 3600),
+    }
+}
+
+fn device_icon(kind: DeviceKind) -> Icon {
+    match kind {
+        DeviceKind::Desktop => Icon::Computer,
+        DeviceKind::Mobile => Icon::Phone,
+        DeviceKind::Unknown => Icon::Unknown,
+    }
+}
+
+/// A small red count bubble.
+fn badge(ui: &egui::Ui, center: egui::Pos2, count: usize) {
+    let text = if count > 9 { "9+".to_string() } else { count.to_string() };
+    let width = if count > 9 { 24.0 } else { 18.0 };
+    let rect = egui::Rect::from_center_size(center, vec2(width, 18.0));
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(9), BADGE_COLOR);
+    theme::text_at(ui, rect.center(), egui::Align2::CENTER_CENTER, &text, egui::FontId::new(11.5, theme::bold()), Color32::WHITE);
+}
+
+/// The outcome of the last send, shown above the file list until dismissed.
+fn send_result(ui: &mut egui::Ui, s: &Shared, actions: &mut Actions) {
+    let p = pal(ui);
+    match &s.send {
+        SendStatus::Idle | SendStatus::Sending(_) => {}
+        SendStatus::Done(r) => {
+            let secs = r.elapsed.as_secs_f64().max(0.001);
+            let ok = r.failed.is_empty();
+            theme::banner(ui, if ok { p.ok_soft } else { p.warn_soft }, |ui| {
+                let color = if ok { p.ok } else { p.warn };
+                ui.label(
+                    RichText::new(format!("Sent {} file{} to {}", r.sent.len(), plural(r.sent.len()), s.send_to))
+                        .family(theme::bold())
+                        .color(color),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} in {secs:.1}s ({}/s)",
+                        human_size(r.bytes),
+                        human_size((r.bytes as f64 / secs) as u64)
+                    ))
+                    .size(13.0)
+                    .color(color),
+                );
+                if !r.failed.is_empty() {
+                    ui.label(RichText::new(format!("Failed verification: {}", r.failed.join(", "))).size(13.0).color(p.err));
+                }
+                if theme::button(ui, Kind::Text, None, "Dismiss", true).clicked() {
+                    actions.dismiss_send = true;
+                }
+            });
         }
-        for line in s.log.iter().rev() {
-            let color = if line.ok { ui.visuals().text_color() } else { ERR_COLOR };
-            ui.colored_label(color, &line.text);
+        SendStatus::Failed(e) => {
+            theme::banner(ui, p.err_soft, |ui| {
+                ui.label(RichText::new(format!("Send to {} failed", s.send_to)).family(theme::bold()).color(p.err));
+                ui.label(RichText::new(e).size(13.0).color(p.err));
+                if theme::button(ui, Kind::Text, None, "Dismiss", true).clicked() {
+                    actions.dismiss_send = true;
+                }
+            });
         }
     }
 }
@@ -611,7 +1086,8 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
         ReceiveEvent::Connected { .. } => {}
         ReceiveEvent::FileStarted { peer, name, size } => {
             s.incoming.retain(|i| i.peer != peer);
-            s.incoming.push(Incoming { peer, name, received: 0, size });
+            let from = s.name_for(&peer);
+            s.incoming.push(Incoming { peer, from, name, received: 0, size });
         }
         ReceiveEvent::FileProgress { peer, received, .. } => {
             if let Some(i) = s.incoming.iter_mut().find(|i| i.peer == peer) {
@@ -621,51 +1097,30 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
         ReceiveEvent::FileSaved { peer, path, size } => {
             s.incoming.retain(|i| i.peer != peer);
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            s.log.push(LogLine { ok: true, text: format!("Saved {name} ({})", human_size(size)) });
+            let from = s.name_for(&peer);
+            s.received.push(Received { ok: true, name, size, from, note: String::new(), path: Some(path), at: Instant::now() });
         }
         ReceiveEvent::FileRejected { peer, name, reason } => {
             s.incoming.retain(|i| i.peer != peer);
-            s.log.push(LogLine { ok: false, text: format!("Rejected {name}: {reason}") });
+            let from = s.name_for(&peer);
+            s.received.push(Received { ok: false, name, size: 0, from, note: format!("Rejected, {reason}"), path: None, at: Instant::now() });
         }
         ReceiveEvent::SessionEnded { peer, error } => {
             s.incoming.retain(|i| i.peer != peer);
             if let Some(e) = error {
-                s.log.push(LogLine { ok: false, text: format!("Transfer from {peer} failed: {e}") });
+                let from = s.name_for(&peer);
+                s.received.push(Received { ok: false, name: "Transfer failed".into(), size: 0, from, note: e, path: None, at: Instant::now() });
             }
         }
     }
 }
 
-/// A small monitor or phone outline, drawn with shapes so it needs no font or image.
-fn device_icon(ui: &mut egui::Ui, kind: DeviceKind) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-    let stroke = egui::Stroke::new(1.5, ui.visuals().text_color());
-    let p = ui.painter();
-    let at = |x: f32, y: f32| rect.min + egui::vec2(x, y);
-    match kind {
-        DeviceKind::Desktop => {
-            p.rect_stroke(egui::Rect::from_min_max(at(1.0, 2.5), at(17.0, 12.5)), 2.0, stroke, egui::StrokeKind::Inside);
-            p.line_segment([at(9.0, 12.5), at(9.0, 15.5)], stroke);
-            p.line_segment([at(5.5, 15.5), at(12.5, 15.5)], stroke);
-        }
-        DeviceKind::Mobile => {
-            p.rect_stroke(egui::Rect::from_min_max(at(4.5, 1.0), at(13.5, 17.0)), 2.5, stroke, egui::StrokeKind::Inside);
-            p.line_segment([at(8.0, 14.0), at(10.0, 14.0)], stroke);
-        }
-        DeviceKind::Unknown => {
-            p.circle_stroke(rect.center(), 7.0, stroke);
-        }
+/// Android does not tell egui about the system dark mode, so ask the framework.
+#[cfg(target_os = "android")]
+fn sync_theme(ctx: &egui::Context) {
+    if let Some(dark) = platform::is_dark_mode() {
+        ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
     }
-    response.on_hover_text(match kind {
-        DeviceKind::Desktop => "Computer",
-        DeviceKind::Mobile => "Mobile device",
-        DeviceKind::Unknown => "Unknown device type",
-    });
-}
-
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(title).strong().size(16.0));
 }
 
 impl eframe::App for AirLynxApp {
@@ -681,55 +1136,67 @@ impl eframe::App for AirLynxApp {
             }
         }
 
-        egui::Panel::top("header").show(ui, |ui| {
-            #[cfg(target_os = "android")]
-            ui.add_space(platform::status_bar_height_px() / ctx.pixels_per_point());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("AirLynx").strong());
-                ui.label(RichText::new(&self.identity.name).weak());
-            });
-            if let Some(notice) = &self.notice {
-                ui.colored_label(ERR_COLOR, notice);
+        let shared = self.shared.lock().unwrap().clone();
+        if self.tab == Tab::Received {
+            self.seen_received = shared.received.len();
+        }
+        let unseen = self.unseen(&shared);
+        let wide = ctx.content_rect().width() >= WIDE_WIDTH;
+        let browsing = self.browsing();
+        let p = pal(ui);
+
+        if wide {
+            self.sidebar(ui, unseen);
+        } else {
+            self.header(ui, &ctx);
+            if !browsing {
+                self.tab_bar(ui, unseen);
             }
-            if !self.browsing() {
-                ui.horizontal(|ui| {
-                    for tab in Tab::ALL {
-                        ui.selectable_value(&mut self.tab, tab, tab.label());
+        }
+
+        #[allow(unused_mut)]
+        let mut margin = if wide { egui::Margin::symmetric(28, 24) } else { egui::Margin::symmetric(16, 4) };
+        // The browser hides the tab bar, so it has to clear the gesture bar itself.
+        #[cfg(target_os = "android")]
+        if browsing {
+            margin.bottom = (platform::navigation_bar_height_px() / ctx.pixels_per_point()) as i8;
+        }
+        egui::CentralPanel::default_margins()
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(margin))
+            .show(ui, |ui| {
+                #[cfg(target_os = "android")]
+                if let Some(browser) = &mut self.browser {
+                    match browser.ui(ui) {
+                        crate::browser::Action::None => {}
+                        crate::browser::Action::Cancel => self.browser = None,
+                        crate::browser::Action::Confirm(paths) => {
+                            self.browser = None;
+                            self.add_files(paths);
+                        }
                     }
+                    return;
+                }
+
+                if let Some(notice) = &self.notice {
+                    theme::banner(ui, p.err_soft, |ui| {
+                        ui.label(RichText::new(notice).color(p.err));
+                    });
+                }
+                if wide {
+                    ui.label(RichText::new(self.tab.title()).family(theme::bold()).size(24.0));
+                    ui.add_space(4.0);
+                }
+                let mut actions = Actions::default();
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    match self.tab {
+                        Tab::Send => self.send_page(ui, &ctx, &shared, wide, &mut actions),
+                        Tab::Received => self.received_page(ui, &shared, &mut actions),
+                        Tab::Settings => self.settings_page(ui, &ctx, &mut actions),
+                    }
+                    ui.add_space(12.0);
                 });
-            }
-            ui.add_space(4.0);
-        });
-
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            #[cfg(target_os = "android")]
-            if let Some(browser) = &mut self.browser {
-                match browser.ui(ui) {
-                    crate::browser::Action::None => {}
-                    crate::browser::Action::Cancel => self.browser = None,
-                    crate::browser::Action::Confirm(paths) => {
-                        self.browser = None;
-                        self.add_files(paths);
-                    }
-                }
-                return;
-            }
-
-            let shared = self.shared.lock().unwrap().clone();
-            let sending = matches!(shared.send, SendStatus::Sending(_));
-            let mut actions = Actions::default();
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.tab {
-                Tab::Transfer => {
-                    self.files_section(ui, sending);
-                    self.favorites_section(ui, &shared, sending, &mut actions);
-                    self.send_status(ui, &shared);
-                    self.nearby_section(ui, &shared, &mut actions);
-                    self.receive_section(ui, &ctx, &shared, &mut actions);
-                }
-                Tab::History => self.history_tab(ui, &shared),
+                self.apply(&ctx, actions);
             });
-            self.apply(&ctx, actions);
-        });
     }
 }

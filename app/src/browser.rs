@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use airlynx_core::human_size;
 use eframe::egui::{self, RichText};
 
+use crate::theme::{self, Icon, Kind, pal};
+
 pub enum Action {
     None,
     Cancel,
@@ -78,17 +80,17 @@ impl FileBrowser {
         let mut navigate = None;
 
         ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
+            if theme::button(ui, Kind::Secondary, None, "Cancel", true).clicked() {
                 action = Action::Cancel;
             }
             let label = format!("Add {} file(s)", self.selected.len());
-            if ui.add_enabled(!self.selected.is_empty(), egui::Button::new(label)).clicked() {
+            if theme::button(ui, Kind::Primary, Some(Icon::Plus), &label, !self.selected.is_empty()).clicked() {
                 action = Action::Confirm(self.selected.iter().cloned().collect());
             }
         });
         ui.horizontal(|ui| {
             let at_root = self.cwd == self.root;
-            if ui.add_enabled(!at_root, egui::Button::new("Up")).clicked() {
+            if theme::button(ui, Kind::Secondary, None, "Up", !at_root).clicked() {
                 navigate = self.cwd.parent().map(Path::to_path_buf);
             }
             let relative = self.cwd.strip_prefix(&self.root).unwrap_or(&self.cwd);
@@ -97,12 +99,12 @@ impl FileBrowser {
         ui.separator();
 
         if let Some(err) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(0xe5, 0x53, 0x4b), err);
+            ui.colored_label(pal(ui).err, err);
         }
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             for item in &self.items {
                 if item.is_dir {
-                    if ui.button(format!("{}/", item.name)).clicked() {
+                    if folder_row(ui, &item.name).clicked() {
                         navigate = Some(item.path.clone());
                     }
                 } else {
@@ -124,4 +126,16 @@ impl FileBrowser {
         }
         action
     }
+}
+
+/// A full-width tappable row for a folder.
+fn folder_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let p = pal(ui);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
+    let fill = if response.hovered() { p.accent_soft } else { p.surface };
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(12), fill);
+    ui.painter().rect_stroke(rect, egui::CornerRadius::same(12), egui::Stroke::new(1.0, p.line), egui::StrokeKind::Inside);
+    Icon::Folder.paint(ui.painter(), egui::Rect::from_center_size(rect.left_center() + egui::vec2(24.0, 0.0), egui::Vec2::splat(22.0)), p.accent_text, 1.8);
+    theme::text_at(ui, rect.left_center() + egui::vec2(48.0, 0.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(15.0), p.text);
+    response
 }

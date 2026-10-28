@@ -265,6 +265,50 @@ pub fn set_keep_awake(on: bool) {
     });
 }
 
+/// Whether the system is in dark mode. NativeActivity does not report it to winit.
+pub fn is_dark_mode() -> Option<bool> {
+    with_env(|env, activity| {
+        let res = env
+            .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?
+            .l()?;
+        let config = env
+            .call_method(&res, "getConfiguration", "()Landroid/content/res/Configuration;", &[])?
+            .l()?;
+        let mode = env.get_field(&config, "uiMode", "I")?.i()?;
+        // UI_MODE_NIGHT_MASK is 0x30 and UI_MODE_NIGHT_YES is 0x20.
+        Ok(mode & 0x30 == 0x20)
+    })
+}
+
+/// Height of the navigation bar (or gesture bar) in physical pixels. NativeActivity draws
+/// underneath it as well. Zero until the window is attached.
+pub fn navigation_bar_height_px() -> f32 {
+    static HEIGHT: OnceLock<f32> = OnceLock::new();
+    if let Some(h) = HEIGHT.get() {
+        return *h;
+    }
+    let height = with_env(|env, activity| {
+        let window = env.call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
+        let decor = env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
+        let insets = env
+            .call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])?
+            .l()?;
+        if insets.is_null() {
+            return Ok(None);
+        }
+        let mask = env.call_static_method("android/view/WindowInsets$Type", "navigationBars", "()I", &[])?.i()?;
+        let bars = env
+            .call_method(&insets, "getInsets", "(I)Landroid/graphics/Insets;", &[JValue::Int(mask)])?
+            .l()?;
+        Ok(Some(env.get_field(&bars, "bottom", "I")?.i()? as f32))
+    })
+    .flatten();
+    match height {
+        Some(h) => *HEIGHT.get_or_init(|| h),
+        None => 0.0,
+    }
+}
+
 /// Height of the status bar in physical pixels. NativeActivity draws underneath it,
 /// so the UI has to leave this much room at the top.
 pub fn status_bar_height_px() -> f32 {

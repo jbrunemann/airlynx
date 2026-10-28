@@ -90,6 +90,11 @@ def full_icon():
     return svg(body, BG_GRADIENT)
 
 
+def logo():
+    """The in-app mark: the rounded square cropped to its edges, so the UI can size it exactly."""
+    return full_icon().replace('viewBox="0 0 1024 1024"', 'viewBox="100 100 824 824"')
+
+
 def adaptive_background():
     return svg('<rect width="1024" height="1024" fill="url(#bg)"/>', BG_GRADIENT)
 
@@ -120,6 +125,7 @@ def write(path, text):
 def main():
     write(os.path.join(OUT, "airlynx.svg"), full_icon())
     render(full_icon(), 512, os.path.join(OUT, "airlynx.png"))
+    render(logo(), 192, os.path.join(OUT, "airlynx-logo.png"))
 
     # Android: adaptive icon (108dp canvas) at every density, plus the monochrome layer.
     for name, px in (("mdpi", 108), ("hdpi", 162), ("xhdpi", 216), ("xxhdpi", 324), ("xxxhdpi", 432)):
