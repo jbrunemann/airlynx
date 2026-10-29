@@ -327,6 +327,65 @@ pub fn held_locks() -> Vec<&'static str> {
     HELD.lock().unwrap().locks.iter().map(|(name, _)| *name).collect()
 }
 
+/// One entry of Android's record of how an earlier process of this app ended (`ApplicationExitInfo`).
+#[derive(Clone, Debug)]
+pub struct ExitRecord {
+    pub unix_ms: i64,
+    pub reason: i32,
+    /// The signal number when the reason is `signaled` (9 is SIGKILL), otherwise the exit code.
+    pub status: i32,
+    /// `ActivityManager.RunningAppProcessInfo` importance when the process died: 125 foreground
+    /// service, 400 cached.
+    pub importance: i32,
+    pub description: String,
+}
+
+/// The most recent exits of this app's processes, newest first. Android keeps them across restarts,
+/// which makes this the way to learn why the receiver stopped while nobody was looking.
+pub fn exit_reasons(max: i32) -> Vec<ExitRecord> {
+    with_env(|env, activity| {
+        let context = env
+            .call_method(activity, "getApplicationContext", "()Landroid/content/Context;", &[])?
+            .l()?;
+        let package = env.call_method(&context, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
+        let manager = system_service(env, &context, "activity")?;
+        let list = env
+            .call_method(
+                &manager,
+                "getHistoricalProcessExitReasons",
+                "(Ljava/lang/String;II)Ljava/util/List;",
+                &[JValue::Object(&package), JValue::Int(0), JValue::Int(max)],
+            )?
+            .l()?;
+        let size = env.call_method(&list, "size", "()I", &[])?.i()?;
+        let mut records = Vec::new();
+        for i in 0..size {
+            let info = env.call_method(&list, "get", "(I)Ljava/lang/Object;", &[JValue::Int(i)])?.l()?;
+            let description = env.call_method(&info, "getDescription", "()Ljava/lang/String;", &[])?.l()?;
+            records.push(ExitRecord {
+                unix_ms: env.call_method(&info, "getTimestamp", "()J", &[])?.j()?,
+                reason: env.call_method(&info, "getReason", "()I", &[])?.i()?,
+                status: env.call_method(&info, "getStatus", "()I", &[])?.i()?,
+                importance: env.call_method(&info, "getImportance", "()I", &[])?.i()?,
+                description: if description.is_null() { String::new() } else { java_string(env, description)? },
+            });
+        }
+        Ok(records)
+    })
+    .unwrap_or_default()
+}
+
+/// Whether the screen is on. One cheap call, for the logging thread to poll.
+pub fn screen_on() -> Option<bool> {
+    with_env(|env, activity| {
+        let context = env
+            .call_method(activity, "getApplicationContext", "()Landroid/content/Context;", &[])?
+            .l()?;
+        let power = system_service(env, &context, "power")?;
+        env.call_method(&power, "isInteractive", "()Z", &[])?.z()
+    })
+}
+
 /// Battery and power state, for the Diagnostics card.
 #[derive(Clone, Copy, Debug)]
 pub struct PowerInfo {

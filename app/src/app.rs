@@ -1071,9 +1071,17 @@ impl AirLynxApp {
                     });
                 });
             }
+            let exits = self.diag.exit_lines();
+            if !exits.is_empty() {
+                ui.add_space(4.0);
+                theme::sub(ui, "How earlier runs of the app ended (newest first)");
+                for line in exits {
+                    ui.label(RichText::new(line).monospace().size(11.5));
+                }
+            }
             ui.add_space(4.0);
             let mut logging = self.diag.logging();
-            if ui.checkbox(&mut logging, "Write a log line every minute").changed() {
+            if ui.checkbox(&mut logging, "Write a log file (every minute and on changes)").changed() {
                 let path = self.receive_dir.join("airlynx-diag.log");
                 self.diag.set_logging(logging, &path);
             }

@@ -209,7 +209,7 @@ $ADB logcat | grep -i airlynx
 state, whether the locks are held, process CPU time and how often the loops wake up, all counted since a baseline
 ("Reset baseline"). The screen being on inflates the numbers, so for a real test:
 
-1. Unplug the phone (while charging the drain is not measured), open Settings and tick **Write a log line every minute**.
+1. Unplug the phone (while charging the drain is not measured), open Settings and tick **Write a log file**.
    That also resets the baseline and appends a header line to `airlynx-diag.log` in the save folder
    (`Download/AirLynx` with file access).
 2. Lock the phone and leave it for an hour or more.
@@ -217,22 +217,36 @@ state, whether the locks are held, process CPU time and how often the loops wake
    favorite (the Mac saves it in `~/Downloads/AirLynx`). With adb it is `adb pull /sdcard/Download/AirLynx/airlynx-diag.log`.
    Each line is also logged to logcat (`adb logcat -d | grep airlynx_app::diag`).
 
-Each line is self-contained: `ts` is the Unix time, `start_uah - uah` over `up_s` gives the drain in microampere-hours
-(`start_pct` and `pct` are the coarse version), `cpu_s` is CPU time used since the baseline, and `accept_polls` /
-`discovery_polls` count loop wakeups. `uah` and `current_ua` show `-` or odd values on devices that do not report them.
-`current_ua` has a device-specific sign and is noisy, so trust the charge counter over it. Runs are appended, and a
-`#` header line starts each app version and device.
+Each line is self-contained. `ts` is the Unix time, and `start_uah - uah` over `ts` gives the drain in
+microampere-hours (`start_pct` and `pct` are the coarse version). Work out rates from `ts` or `wall_s`, which keep
+running while the phone sleeps. `awake_s` is the time the process could run, so `awake_s / wall_s` is how much of the time
+the phone was awake. `cpu_s` is CPU time since the baseline, and `accept_polls` / `discovery_polls` count loop
+wakeups (while awake). `uah` is `-` on devices that do not report it, and `current_raw` is in a device-specific unit and
+sign (this Galaxy reports milliamperes), so trust the charge counter. `event` says why the line was written: `start`,
+`tick` (a minute of real time passed), `screen` (the screen turned on or off) or `exp` (a switch changed). Without the
+wake lock the CPU sleeps for minutes at a time and lines only appear when it wakes, so use the `screen` lines as the
+start and end of each screen-off stretch. Runs are appended, and a `#` header line starts each one.
+
+The log also explains why it stopped. Each run starts with `# earlier exit` lines from Android's own record of how
+earlier processes of the app ended (`reason=signaled status=9 importance=cached` means it was killed while cached,
+`importance=foreground-service` means the service did not protect it, `freezer`, `low-memory` and `user-requested` are
+what they say). The same list is on the Diagnostics card. A `# app closed` line means the activity was destroyed
+cleanly (the receiver lives in it, so it stops too), and a `# panic` line gives the message of a crashed thread. A log
+that just ends with none of these, and no new exit entry afterwards, means the process was gone without Android
+recording anything, which would be unusual.
 
 **Finding out which part costs battery:** the card has an Experiments section with five switches: receiver on (off is
 the control run: no service, no locks, no threads), CPU wake lock, Wi-Fi lock, multicast lock and slow polling (1 s
 instead of 0.1 s). Each change restarts the receiver and the baseline, and every log line records the combination as
 `exp=rx:1,wake:1,wifi:1,mcast:1,poll:100` along with the locks actually held. The switches are not saved, so a
 restart goes back to everything on. A suggested sequence, with the phone unplugged and about 30 minutes per step
-(the charge counter moves in 3.7 mAh steps, so shorter runs are too coarse):
+(the charge counter moves in 3.7 mAh steps, so shorter runs are too coarse; the other phone activity is large, so
+differences under about 20 mAh/h will not show up):
 
-1. Receiver off (control), then everything on, then switch off one lock at a time and leave it off: Wi-Fi lock, CPU wake
-   lock, multicast lock, then slow polling. Finish with the control again to see whether the drain drifted.
-2. Wake the phone only to flip a switch, then lock it again. Compare only the lines with `screen=false`.
+1. Receiver off (control), then everything on, then CPU wake lock off, 40 minutes or more each. Then try the Wi-Fi lock,
+   multicast lock and slow polling the same way. Finish with the control again to see whether the drain drifted.
+2. Wake the phone only to flip a switch, then lock it again and leave it alone. Compare the drain between a `screen`
+   line that turned the screen off and the next `screen` line that turned it on.
 3. Send the file back and subtract each step's drain from the one before. Slow polling delays accepting a new
    connection by up to a second, and the other switches can make discovery or the first transfer slower, so also
    check that a send from the Mac still works in each state.
