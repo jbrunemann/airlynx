@@ -1,7 +1,10 @@
 //! Android glue: JNI calls into the framework for things NativeActivity lacks.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use winit::platform::android::activity::AndroidApp;
 use airlynx_core::DeviceKind;
@@ -41,11 +44,31 @@ pub fn init(app: AndroidApp) {
     let _ = APP.set(app);
 }
 
+/// winit ignores the activity's `onDestroy`, so the event loop never ends and `NativeActivity.onDestroy`
+/// blocks the main thread waiting for it until Android reports an ANR. Watch for the destroy and leave
+/// the process instead, which is what swiping the app away does anyway.
+pub fn exit_when_destroyed() {
+    let spawned = thread::Builder::new().name("airlynx-destroy-watch".into()).spawn(|| {
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            if with_env(|env, activity| env.call_method(activity, "isDestroyed", "()Z", &[])?.z()) == Some(true) {
+                crate::diag::note("app closed, activity destroyed");
+                set_keep_awake(false);
+                std::process::exit(0);
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("could not start the destroy watcher: {e}");
+    }
+}
+
 /// Runs `f` with a JNI env and the activity, logging and clearing any Java exception.
+/// The thread stays attached until it ends, so a polling thread does not attach on every call.
 fn with_env<R>(f: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> jni::errors::Result<R>) -> Option<R> {
     let app = APP.get()?;
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
+    let mut env = vm.attach_current_thread_permanently().ok()?;
     let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
     let result = f(&mut env, &activity);
     if env.exception_check().unwrap_or(false) {
@@ -351,11 +374,50 @@ pub struct ExitRecord {
     /// service, 400 cached.
     pub importance: i32,
     pub description: String,
+    /// File in the trace folder with the stack traces Android took when the process hung (`anr`) or
+    /// crashed natively. Only those two reasons come with one.
+    pub trace_file: Option<String>,
+}
+
+/// Stack traces of an ANR or a native crash can be megabytes. More than this is cut off.
+const TRACE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Copies the trace Android took for `info` (an `ApplicationExitInfo`) into `path`. False when
+/// Android kept none.
+fn save_trace(env: &mut JNIEnv<'_>, info: &JObject<'_>, path: &Path) -> jni::errors::Result<bool> {
+    let stream = env.call_method(info, "getTraceInputStream", "()Ljava/io/InputStream;", &[])?.l()?;
+    if stream.is_null() {
+        return Ok(false);
+    }
+    let buffer = env.new_byte_array(16 * 1024)?;
+    let mut chunk = [0i8; 16 * 1024];
+    let mut data = Vec::new();
+    while data.len() < TRACE_LIMIT {
+        let read = env.call_method(&stream, "read", "([B)I", &[JValue::Object(&buffer)])?.i()?;
+        // read returns -1 at the end of the stream.
+        let Ok(read) = usize::try_from(read) else { break };
+        if read == 0 {
+            break;
+        }
+        env.get_byte_array_region(&buffer, 0, &mut chunk[..read])?;
+        data.extend(chunk[..read].iter().map(|b| b.cast_unsigned()));
+    }
+    env.call_method(&stream, "close", "()V", &[])?;
+    match fs::write(path, &data) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            log::warn!("could not save the trace to {}: {e}", path.display());
+            Ok(false)
+        }
+    }
 }
 
 /// The most recent exits of this app's processes, newest first. Android keeps them across restarts,
-/// which makes this the way to learn why the receiver stopped while nobody was looking.
-pub fn exit_reasons(max: i32) -> Vec<ExitRecord> {
+/// which makes this the way to learn why the receiver stopped while nobody was looking. The stack
+/// traces of hangs and native crashes among them are saved in `trace_dir`, once each, so they can be
+/// sent off the device.
+pub fn exit_reasons(max: i32, trace_dir: &Path) -> Vec<ExitRecord> {
+    let _ = fs::create_dir_all(trace_dir);
     with_env(|env, activity| {
         let context = env
             .call_method(activity, "getApplicationContext", "()Landroid/content/Context;", &[])?
@@ -375,12 +437,26 @@ pub fn exit_reasons(max: i32) -> Vec<ExitRecord> {
         for i in 0..size {
             let info = env.call_method(&list, "get", "(I)Ljava/lang/Object;", &[JValue::Int(i)])?.l()?;
             let description = env.call_method(&info, "getDescription", "()Ljava/lang/String;", &[])?.l()?;
+            let unix_ms = env.call_method(&info, "getTimestamp", "()J", &[])?.j()?;
+            let reason = env.call_method(&info, "getReason", "()I", &[])?.i()?;
+            // REASON_CRASH_NATIVE = 5 (a protobuf tombstone), REASON_ANR = 6 (text)
+            let trace_file = matches!(reason, 5 | 6)
+                .then(|| format!("airlynx-trace-{}.{}", unix_ms / 1000, if reason == 6 { "txt" } else { "pb" }))
+                .filter(|name| {
+                    trace_dir.join(name).exists()
+                        || save_trace(env, &info, &trace_dir.join(name)).unwrap_or_else(|e| {
+                            log::warn!("could not read the trace of an exit: {e}");
+                            let _ = env.exception_clear();
+                            false
+                        })
+                });
             records.push(ExitRecord {
-                unix_ms: env.call_method(&info, "getTimestamp", "()J", &[])?.j()?,
-                reason: env.call_method(&info, "getReason", "()I", &[])?.i()?,
+                unix_ms,
+                reason,
                 status: env.call_method(&info, "getStatus", "()I", &[])?.i()?,
                 importance: env.call_method(&info, "getImportance", "()I", &[])?.i()?,
                 description: if description.is_null() { String::new() } else { java_string(env, description)? },
+                trace_file,
             });
         }
         Ok(records)

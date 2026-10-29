@@ -238,9 +238,15 @@ The log also explains why it stopped. Each run starts with `# earlier exit` line
 earlier processes of the app ended (`reason=signaled status=9 importance=cached` means it was killed while cached,
 `importance=foreground-service` means the service did not protect it, `freezer`, `low-memory` and `user-requested` are
 what they say). The same list is on the Diagnostics card. A `# app closed` line means the activity was destroyed
-cleanly (the receiver lives in it, so it stops too), and a `# panic` line gives the message of a crashed thread. A log
+(the receiver lives in it, so it stops too; winit ignores Android's destroy event, so a watcher thread notices
+`Activity.isDestroyed()` and exits the process, otherwise `onDestroy` blocks the main thread into an ANR), and a `# panic` line gives the message of a crashed thread. A log
 that just ends with none of these, and no new exit entry afterwards, means the process was gone without Android
 recording anything, which would be unusual.
+
+For a hang (`reason=anr`) or a native crash, Android also keeps the stack traces it took. On start the app saves them next to
+the log as `airlynx-trace-<unix seconds>.txt` (`.pb` for a native crash), once per exit, and the exit line says
+`trace=<file>`. Send that file off the device like the log: it shows what every thread was doing, so a spinning thread
+and a blocked one look different, and the frames in `libairlynx_app.so` point at the code.
 
 **Finding out which part costs battery:** the card has an Experiments section with five switches: receiver on (off is
 the control run: no service, no locks, no threads), CPU wake lock, Wi-Fi lock, multicast lock and slow polling (1 s

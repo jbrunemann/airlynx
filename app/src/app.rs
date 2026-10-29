@@ -217,7 +217,7 @@ impl AirLynxApp {
             #[cfg(target_os = "android")]
             browser: None,
             #[cfg(target_os = "android")]
-            diag: crate::diag::Diagnostics::new(),
+            diag: crate::diag::Diagnostics::new(&platform::default_receive_dir()),
         };
         app.start_receiver(&cc.egui_ctx);
         app.start_scan(&cc.egui_ctx, true);

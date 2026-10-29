@@ -117,10 +117,11 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
-    pub fn new() -> Self {
+    /// `trace_dir` is where the stack traces of earlier hangs are saved.
+    pub fn new(trace_dir: &Path) -> Self {
         let now = Sample::now();
         Self {
-            exits: android::exit_reasons(EXITS_SHOWN),
+            exits: android::exit_reasons(EXITS_SHOWN, trace_dir),
             experiments: Arc::default(),
             baseline: Arc::new(Mutex::new(now)),
             current: now,
@@ -324,12 +325,6 @@ impl Drop for Diagnostics {
     }
 }
 
-impl Default for Diagnostics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn drain(base: &Sample, now: &Sample) -> String {
     let (Some(b), Some(n)) = (base.power, now.power) else { return "unknown".into() };
     if b.charging || n.charging {
@@ -417,7 +412,8 @@ fn exit_fields(e: &ExitRecord) -> String {
     };
     let ts = e.unix_ms / 1000;
     let description = e.description.replace(char::is_whitespace, "_");
-    format!("ts={ts} reason={reason} status={} importance={importance} description={description}", e.status)
+    let trace = e.trace_file.as_ref().map_or(String::new(), |name| format!(" trace={name}"));
+    format!("ts={ts} reason={reason} status={} importance={importance} description={description}{trace}", e.status)
 }
 
 /// Appends `# <note> ts=<unix seconds>` to the log, for events between the regular lines.
@@ -447,6 +443,15 @@ fn note_panics_in(path: &Path) {
             previous(info);
         }));
     });
+}
+
+/// Notes an event in the log, if one is being written, for code that does not own the `Diagnostics`.
+pub fn note(text: &str) {
+    if let Ok(guard) = PANIC_LOG.lock()
+        && let Some(path) = guard.as_deref()
+    {
+        append_note(path, text);
+    }
 }
 
 fn unix_millis() -> u64 {
