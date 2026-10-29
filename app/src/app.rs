@@ -170,6 +170,8 @@ pub struct AirLynxApp {
     receive_dir: PathBuf,
     receiver: Option<ReceiverHandle>,
     receiver_error: Option<String>,
+    /// Why the last Open on the Received page did not work.
+    open_error: Option<String>,
     last_scan: Instant,
     #[cfg(target_os = "android")]
     last_dir_check: Instant,
@@ -208,6 +210,7 @@ impl AirLynxApp {
             receive_dir: platform::default_receive_dir(),
             receiver: None,
             receiver_error: None,
+            open_error: None,
             last_scan: Instant::now(),
             #[cfg(target_os = "android")]
             last_dir_check: Instant::now(),
@@ -872,6 +875,15 @@ impl AirLynxApp {
             });
         }
 
+        if let Some(error) = self.open_error.clone() {
+            theme::banner(ui, p.err_soft, |ui| {
+                ui.label(RichText::new(error).color(p.err));
+                if theme::button(ui, Kind::Text, None, "Dismiss", true).clicked() {
+                    self.open_error = None;
+                }
+            });
+        }
+
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("History").family(theme::bold()).size(16.0));
@@ -901,7 +913,7 @@ impl AirLynxApp {
                     } else {
                         theme::tile(ui, Icon::Warning, 36.0, Tint::Error);
                     }
-                    let open = cfg!(not(target_os = "android")) && item.ok && item.path.is_some();
+                    let open = item.ok && item.path.is_some();
                     let mid_w = (ui.available_width() - if open { 60.0 } else { 0.0 } - 12.0).max(40.0);
                     ui.allocate_ui_with_layout(vec2(mid_w, 36.0), Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
@@ -914,14 +926,12 @@ impl AirLynxApp {
                         };
                         ui.add(egui::Label::new(RichText::new(detail).small().color(color)).truncate());
                     });
-                    #[cfg(not(target_os = "android"))]
                     if open {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::button(ui, Kind::Text, None, "Open", true).clicked()
                                 && let Some(path) = &item.path
                             {
-                                // The opener launches files as well as folders.
-                                platform::open_folder(path);
+                                self.open_error = platform::open_file(path).err();
                             }
                         });
                     }
@@ -1209,6 +1219,18 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
         ReceiveEvent::Refused { id, name, .. } => {
             s.requests.retain(|r| r.id != id);
             s.requests.push(Request { id, name });
+        }
+        ReceiveEvent::NotWritable { peer, error } => {
+            let from = s.name_for(&peer);
+            s.received.push(Received {
+                ok: false,
+                name: "Transfer refused".into(),
+                size: 0,
+                from,
+                note: format!("Save folder is not writable ({error})"),
+                path: None,
+                at: Instant::now(),
+            });
         }
         ReceiveEvent::Connected { .. } => {}
         ReceiveEvent::FileStarted { peer, name, size } => {

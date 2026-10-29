@@ -16,8 +16,8 @@ fi
 
 (cd app && cargo apk build --release --lib)
 
-# cargo-apk can neither ship Java code nor declare a <service>, and the receive service
-# (app/java) needs both. So: compile it to classes.dex, patch the generated manifest, and
+# cargo-apk can neither ship Java code nor declare a <service> or <provider>, and the receive service and
+# the received-files provider (app/java) need all of that. So: compile it to classes.dex, patch the generated manifest, and
 # reassemble the APK from the pieces cargo-apk left behind.
 BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
 ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
@@ -29,9 +29,10 @@ javac --release 11 -Xlint:-options -cp "$ANDROID_JAR" -d "$WORK/classes" app/jav
 "$BUILD_TOOLS/d8" --min-api 30 --lib "$ANDROID_JAR" --output "$WORK/dex" $(find "$WORK/classes" -name '*.class')
 
 sed -e 's|android:hasCode="false"|android:hasCode="true"|' \
-    -e 's|</application>|<service android:name="dev.airlynx.app.ReceiveService" android:exported="false" android:foregroundServiceType="dataSync"/></application>|' \
+    -e 's|</application>|<service android:name="dev.airlynx.app.ReceiveService" android:exported="false" android:foregroundServiceType="dataSync"/><provider android:name="dev.airlynx.app.ReceivedFilesProvider" android:authorities="dev.airlynx.app.files" android:exported="false" android:grantUriPermissions="true"/></application>|' \
     "$OUT/AndroidManifest.xml" > "$WORK/AndroidManifest.xml"
 grep -q ReceiveService "$WORK/AndroidManifest.xml" || { echo "manifest patch failed" >&2; exit 1; }
+grep -q ReceivedFilesProvider "$WORK/AndroidManifest.xml" || { echo "manifest patch failed" >&2; exit 1; }
 
 "$BUILD_TOOLS/aapt" package -f -F "$WORK/unaligned.apk" -M "$WORK/AndroidManifest.xml" -S app/res -I "$ANDROID_JAR"
 cp "$WORK/dex/classes.dex" "$WORK/classes.dex"

@@ -142,6 +142,19 @@ pub fn has_all_files_access() -> bool {
     .unwrap_or(false)
 }
 
+/// Opens a received file in whichever app handles its type. `MainActivity::openFile` hands the other app a
+/// content:// URI from `ReceivedFilesProvider`, and returns why it could not, if it could not.
+pub fn open_file(path: &Path) -> Result<(), String> {
+    with_env(|env, activity| {
+        let path = env.new_string(path.to_string_lossy())?;
+        let error = env
+            .call_method(activity, "openFile", "(Ljava/lang/String;)Ljava/lang/String;", &[JValue::Object(&path)])?
+            .l()?;
+        if error.is_null() { Ok(Ok(())) } else { Ok(Err(java_string(env, error)?)) }
+    })
+    .unwrap_or_else(|| Err("Could not ask Android to open the file".into()))
+}
+
 /// Opens the system "All files access" settings page for this app.
 pub fn request_all_files_access() {
     with_env(|env, activity| {

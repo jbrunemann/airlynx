@@ -7,7 +7,8 @@
 //!                                               its public key [u8; 32]
 //!   Everything below is encrypted, see `secure`.
 //!   sender id: [u8; 16] | name len: u8 | name: UTF-8
-//!                                             -> receiver replies one status byte
+//!                                             -> receiver replies one status byte (ok, not a
+//!                                               favorite, or no write access; the last two end the session)
 //!   file count: u32
 //!   per file:
 //!     name len: u16 | name: UTF-8 | size: u64 | data | sha256: [u8; 32]
@@ -35,6 +36,8 @@ pub const STATUS_OK: u8 = 0;
 pub const STATUS_HASH_MISMATCH: u8 = 1;
 pub const STATUS_REJECTED: u8 = 2;
 pub const STATUS_NOT_FAVORITE: u8 = 3;
+/// The receiver cannot write to its save folder. Sent in place of the OK after the sender's hello.
+pub const STATUS_NO_WRITE_ACCESS: u8 = 4;
 
 pub fn read_u8(r: &mut impl Read) -> io::Result<u8> {
     let mut b = [0u8; 1];

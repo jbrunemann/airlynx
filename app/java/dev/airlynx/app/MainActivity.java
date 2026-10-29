@@ -1,6 +1,7 @@
 package dev.airlynx.app;
 
 import android.app.NativeActivity;
+import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
 import android.database.Cursor;
@@ -86,6 +87,25 @@ public class MainActivity extends NativeActivity {
                 }
             }
         } catch (IOException ignored) {
+        }
+    }
+
+    /** Opens a received file in whichever app handles its type. Returns null, or why it could not be opened. */
+    public String openFile(String path) {
+        File file = new File(path);
+        if (!file.isFile()) {
+            return "The file no longer exists";
+        }
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(ReceivedFilesProvider.uriFor(file), ReceivedFilesProvider.mimeType(file.getName()));
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(intent);
+            return null;
+        } catch (ActivityNotFoundException e) {
+            return "No app can open this type of file";
+        } catch (RuntimeException e) {
+            return String.valueOf(e.getMessage());
         }
     }
 

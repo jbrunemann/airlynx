@@ -182,6 +182,9 @@ fn run_receive(config: ReceiverConfig) -> io::Result<()> {
         ReceiveEvent::Refused { peer, id, name } => {
             eprintln!("[{peer}] refused \"{name}\" ({id}): not a favorite. Add it with `airlynx favorite add {id} --name \"{name}\"`")
         }
+        ReceiveEvent::NotWritable { peer, error } => {
+            eprintln!("[{peer}] refused: cannot write to the save folder ({error})")
+        }
         ReceiveEvent::Connected { peer, files } => println!("[{peer}] receiving {files} file(s)"),
         ReceiveEvent::FileSaved { peer, path, size } => {
             println!("[{peer}] saved {} ({})", path.display(), human_size(size))

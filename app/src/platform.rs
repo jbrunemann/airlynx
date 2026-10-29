@@ -50,6 +50,16 @@ mod desktop {
     }
 
     pub fn open_folder(path: &Path) {
+        let _ = open_path(path);
+    }
+
+    /// Opens a received file in the default app for its type.
+    pub fn open_file(path: &Path) -> Result<(), String> {
+        open_path(path).map_err(|e| format!("Could not open the file: {e}"))
+    }
+
+    /// The system opener launches files as well as folders.
+    fn open_path(path: &Path) -> std::io::Result<()> {
         let opener = if cfg!(target_os = "macos") {
             "open"
         } else if cfg!(windows) {
@@ -57,6 +67,6 @@ mod desktop {
         } else {
             "xdg-open"
         };
-        let _ = std::process::Command::new(opener).arg(path).spawn();
+        std::process::Command::new(opener).arg(path).spawn().map(|_| ())
     }
 }

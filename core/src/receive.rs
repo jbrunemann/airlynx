@@ -41,6 +41,8 @@ pub struct ReceiverConfig {
 pub enum ReceiveEvent {
     /// A device that is not a favorite tried to send. Nothing was accepted.
     Refused { peer: String, id: DeviceId, name: String },
+    /// A favorite tried to send, but the save folder cannot be written to. Nothing was accepted.
+    NotWritable { peer: String, error: String },
     Connected { peer: String, files: u32 },
     FileStarted { peer: String, name: String, size: u64 },
     FileProgress { peer: String, name: String, received: u64, size: u64 },
@@ -176,6 +178,14 @@ fn handle_session(
         on_event(ReceiveEvent::Refused { peer: peer.into(), id: sender.id, name: sender.name });
         return Ok(());
     }
+    // Say so before the sender streams any data, rather than failing halfway through the first file.
+    // Only favorites get here, so a stranger learns nothing about this device's storage.
+    if let Err(e) = check_writable(dir) {
+        stream.write_all(&[STATUS_NO_WRITE_ACCESS])?;
+        stream.flush()?;
+        on_event(ReceiveEvent::NotWritable { peer: peer.into(), error: e.to_string() });
+        return Ok(());
+    }
     stream.write_all(&[STATUS_OK])?;
     stream.flush()?;
     if let Some(ip) = peer_ip {
@@ -231,6 +241,19 @@ fn handle_session(
         }
     }
     Ok(())
+}
+
+/// Makes sure `dir` exists and a file can be created in it. Permissions can change while the receiver
+/// runs (all-files access revoked, a read-only volume, a deleted folder), so this is asked per session.
+fn check_writable(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(
+        ".airlynx-write-test.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    File::create(&probe)?;
+    fs::remove_file(&probe)
 }
 
 /// Streams `size` bytes into `path`, then reads the sender's hash.
@@ -319,6 +342,15 @@ mod tests {
     /// Runs one receiver session on loopback and returns the sender's result
     /// and the receiver's events.
     fn loopback(favorites: &Favorites, sender: &Identity) -> (io::Result<send::Report>, Vec<ReceiveEvent>) {
+        loopback_to(favorites, sender, |base| base.join("in"))
+    }
+
+    /// Like `loopback`, with the receiver saving to the folder `save_dir` picks inside the scratch folder.
+    fn loopback_to(
+        favorites: &Favorites,
+        sender: &Identity,
+        save_dir: impl FnOnce(&Path) -> PathBuf,
+    ) -> (io::Result<send::Report>, Vec<ReceiveEvent>) {
         let dir = std::env::temp_dir().join(format!("airlynx-recv-{}", DeviceId::random()));
         fs::create_dir_all(&dir).unwrap();
         let src = dir.join("hello.txt");
@@ -329,8 +361,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let server = {
-            let (favorites, events, dir) = (favorites.clone(), events.clone(), dir.join("in"));
-            fs::create_dir_all(&dir).unwrap();
+            let (favorites, events, dir) = (favorites.clone(), events.clone(), save_dir(&dir));
+            let _ = fs::create_dir_all(&dir);
             thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
                 let sink = |e| events.lock().unwrap().push(e);
@@ -352,6 +384,23 @@ mod tests {
         let (result, events) = loopback(&favorites, &me);
         assert_eq!(result.unwrap().sent, ["hello.txt"]);
         assert!(events.iter().any(|e| matches!(e, ReceiveEvent::FileSaved { .. })));
+    }
+
+    #[test]
+    fn unwritable_folder_is_refused_before_any_data() {
+        let me = Identity::new(DeviceId::random(), "Phone");
+        let favorites = Favorites::in_memory();
+        favorites.add(me.id, "Phone", DeviceKind::Unknown).unwrap();
+        // A folder below a regular file can be neither found nor created, whoever runs the test.
+        let (result, events) = loopback_to(&favorites, &me, |base| {
+            let blocker = base.join("blocker");
+            fs::write(&blocker, b"not a folder").unwrap();
+            blocker.join("in")
+        });
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("cannot write"), "{err}");
+        assert!(matches!(&events[..], [ReceiveEvent::NotWritable { .. }]), "{events:?}");
     }
 
     #[test]
