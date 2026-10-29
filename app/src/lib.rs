@@ -1,5 +1,6 @@
 mod app;
 mod platform;
+mod remote;
 mod theme;
 
 #[cfg(target_os = "android")]

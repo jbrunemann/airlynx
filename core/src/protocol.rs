@@ -6,20 +6,31 @@
 //!                                               mismatch, which ends the session), then, if ok,
 //!                                               its public key [u8; 32]
 //!   Everything below is encrypted, see `secure`.
-//!   sender id: [u8; 16] | name len: u8 | name: UTF-8
+//!   sender id: [u8; 16] | name len: u8 | name: UTF-8 | command: u8
 //!                                             -> receiver replies one status byte (ok, not a
-//!                                               favorite, or no write access; the last two end the session)
-//!   file count: u32
-//!   per file:
-//!     name len: u16 | name: UTF-8 | size: u64 | data | sha256: [u8; 32]
+//!                                               favorite, unknown command, or no write access
+//!                                               for a send; all but ok end the session)
+//!   command SEND:
+//!     file count: u32
+//!     per file:
+//!       name len: u16 | name: UTF-8 | size: u64 | data | sha256: [u8; 32]
 //!                                             -> receiver replies one status byte
+//!   command LIST (browse the receiver's save folder, read only):
+//!     path len: u16 | path: UTF-8, "/" separated, relative to the save folder, empty for the folder itself
+//!                                             -> status byte, then if ok:
+//!                                               entry count: u32, per entry:
+//!                                               kind: u8 | name len: u16 | name | size: u64 | modified: u64
+//!   command GET (download one file from the save folder):
+//!     path len: u16 | path: UTF-8
+//!                                             -> status byte, then if ok: size: u64 | data | sha256: [u8; 32]
+//!   Each session carries exactly one command.
 
 use std::io::{self, Read, Write};
 
 use crate::identity::{DeviceId, Identity, clean_name};
 
 pub const MAGIC: &[u8; 4] = b"ALNX";
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 
 pub const DEFAULT_TCP_PORT: u16 = 47800;
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -38,6 +49,19 @@ pub const STATUS_REJECTED: u8 = 2;
 pub const STATUS_NOT_FAVORITE: u8 = 3;
 /// The receiver cannot write to its save folder. Sent in place of the OK after the sender's hello.
 pub const STATUS_NO_WRITE_ACCESS: u8 = 4;
+/// A browse request named something that does not exist, is hidden, or lies outside the save folder.
+pub const STATUS_NOT_FOUND: u8 = 5;
+/// A browse request failed while reading from the save folder.
+pub const STATUS_READ_ERROR: u8 = 6;
+
+/// What a session is for, sent right after the hello.
+pub const COMMAND_SEND: u8 = 1;
+pub const COMMAND_LIST: u8 = 2;
+pub const COMMAND_GET: u8 = 3;
+
+/// Entry kinds in a folder listing.
+pub const ENTRY_FILE: u8 = 0;
+pub const ENTRY_DIR: u8 = 1;
 
 pub fn read_u8(r: &mut impl Read) -> io::Result<u8> {
     let mut b = [0u8; 1];

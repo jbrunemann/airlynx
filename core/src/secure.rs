@@ -50,7 +50,7 @@ impl Ephemeral {
             if is_sender { (self.public, peer_public) } else { (peer_public, self.public) };
         let key = |label: &[u8]| {
             let mut h = Sha256::new();
-            h.update(b"airlynx v4 ");
+            h.update(b"airlynx v5 ");
             h.update(label);
             h.update(shared);
             h.update(sender_pub);

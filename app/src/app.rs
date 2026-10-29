@@ -12,6 +12,7 @@ use airlynx_core::{DEFAULT_TCP_PORT, DeviceId, DeviceKind, Favorites, Identity, 
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, vec2};
 
 use crate::platform;
+use crate::remote::{self, RemoteBrowser};
 use crate::theme::{self, Icon, Kind, Tint, pal};
 
 /// How often the network is scanned in the background.
@@ -147,6 +148,7 @@ impl Shared {
 #[derive(Default)]
 struct Actions {
     send_to: Option<(SocketAddr, String, DeviceId)>,
+    browse: Option<(SocketAddr, String)>,
     add_favorite: Option<(DeviceId, String, DeviceKind)>,
     remove_favorite: Option<DeviceId>,
     dismiss_request: Option<DeviceId>,
@@ -172,6 +174,8 @@ pub struct AirLynxApp {
     receiver_error: Option<String>,
     /// Why the last Open on the Received page did not work.
     open_error: Option<String>,
+    /// A favorite's save folder, open in place of the pages.
+    remote: Option<RemoteBrowser>,
     /// The favorite whose details are open in Settings.
     info_open: Option<DeviceId>,
     last_scan: Instant,
@@ -213,6 +217,7 @@ impl AirLynxApp {
             receiver: None,
             receiver_error: None,
             open_error: None,
+            remote: None,
             info_open: None,
             last_scan: Instant::now(),
             #[cfg(target_os = "android")]
@@ -407,17 +412,22 @@ impl AirLynxApp {
         }
     }
 
-    /// The Android file browser replaces the whole screen, so the tabs are hidden while it is open.
+    /// The file browsers replace the whole screen, so the tabs are hidden while one is open.
     fn browsing(&self) -> bool {
         #[cfg(target_os = "android")]
-        return self.browser.is_some();
-        #[cfg(not(target_os = "android"))]
-        false
+        if self.browser.is_some() {
+            return true;
+        }
+        self.remote.is_some()
     }
 
     fn apply(&mut self, ctx: &egui::Context, actions: Actions) {
         if let Some((addr, name, id)) = actions.send_to {
             self.start_send(ctx, addr, name, id);
+        }
+        if let Some((addr, name)) = actions.browse {
+            let (identity, dir) = (self.identity.clone(), self.receive_dir.clone());
+            self.remote = Some(RemoteBrowser::new(ctx, identity, addr, name, dir));
         }
         if let Some((id, name, kind)) = actions.add_favorite {
             self.set_notice(self.favorites.add(id, &name, kind));
@@ -782,7 +792,9 @@ impl AirLynxApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 theme::tile(ui, device_icon(kind), 44.0, if live.is_some() { Tint::Accent } else { Tint::Muted });
-                let mid_w = (ui.available_width() - 92.0 - 12.0).max(40.0);
+                let can_browse = target.is_none() && live.is_some_and(|peer| peer.mutual);
+                let buttons_w = 92.0 + if can_browse { theme::control_height() + 12.0 } else { 0.0 };
+                let mid_w = (ui.available_width() - buttons_w - 12.0).max(40.0);
                 ui.allocate_ui_with_layout(vec2(mid_w, 44.0), Layout::top_down(Align::Min), |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     let name_color = if live.is_some() { p.text } else { p.sub };
@@ -812,6 +824,12 @@ impl AirLynxApp {
                             && let Some(peer) = live
                         {
                             actions.send_to = Some((peer.addr, fav.name.clone(), fav.id));
+                        }
+                        if can_browse
+                            && theme::icon_button(ui, Icon::Folder, "Browse files").clicked()
+                            && let Some(peer) = live
+                        {
+                            actions.browse = Some((peer.addr, fav.name.clone()));
                         }
                     }
                 });
@@ -1270,7 +1288,8 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
                 at: Instant::now(),
             });
         }
-        ReceiveEvent::Connected { .. } => {}
+        // Looking into the save folder, or taking a file from it, shows nothing in History.
+        ReceiveEvent::Connected { .. } | ReceiveEvent::Listed { .. } | ReceiveEvent::Served { .. } => {}
         ReceiveEvent::FileStarted { peer, name, size } => {
             s.incoming.retain(|i| i.peer != peer);
             let from = s.name_for(&peer);
@@ -1360,6 +1379,13 @@ impl eframe::App for AirLynxApp {
                             self.browser = None;
                             self.add_files(paths);
                         }
+                    }
+                    return;
+                }
+
+                if let Some(remote) = &mut self.remote {
+                    if let remote::Action::Close = remote.ui(ui, &ctx) {
+                        self.remote = None;
                     }
                     return;
                 }

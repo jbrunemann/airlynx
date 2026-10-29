@@ -34,6 +34,8 @@ cargo run --release -p airlynx -- favorite add "Pixel"      # by name or id pref
 cargo run --release -p airlynx -- favorite list | remove <name>
 cargo run --release -p airlynx -- favorite info [name]      # address, port, route, has-you-as-favorite, first/last seen
 cargo run --release -p airlynx -- send a.jpg b.pdf --device Pixel   # or --to 192.168.1.20[:port]
+cargo run --release -p airlynx -- browse [path] --device Pixel      # list a favorite's save folder (read only)
+cargo run --release -p airlynx -- get docs/a.pdf --device Pixel -o .  # download a file from it
 ```
 
 **Pairing in the app:** open AirLynx on both devices. On the **Send** tab, under **Add a device**, tap **Add** next to the other
@@ -59,7 +61,8 @@ Cargo workspace (edition 2024, resolver 3):
 | `core/src/discovery.rs` | | `scan()` / `discover_with()` / `discover()` ask the network and collect `Peer`s (never including the caller): broadcast per interface, unicast to cached addresses and to mDNS finds. Responder thread used by the receiver |
 | `core/src/mdns.rs` | | `_airlynx._tcp` registration while receiving, and one browser thread per process that remembers the addresses it hears about (best effort, off if the daemon cannot start) |
 | `core/src/secure.rs` | | `Ephemeral` X25519 key exchange and `SecureStream`, an encrypted `Read + Write` wrapper (ChaCha20-Poly1305 records) |
-| `core/src/send.rs` | | `prepare()` validates paths, `send_files()` streams them with a progress callback (`ControlFlow::Break` cancels), `resolve()` parses `host[:port]` |
+| `core/src/send.rs` | | `prepare()` validates paths, `send_files()` streams them with a progress callback (`ControlFlow::Break` cancels), `resolve()` parses `host[:port]`, `open_session()` is the connect, handshake and hello shared by every command |
+| `core/src/browse.rs` | | Browsing a favorite's save folder: `list()` and `download()` for the asking side, `serve_list`/`serve_get` and the path checks for the owning side |
 | `core/src/receive.rs` | | `start()` returns a `ReceiverHandle` (stops on `stop()`/drop) and emits `ReceiveEvent`s; refuses non-favorites; filename sanitizing and `name (1).ext` dedup |
 | `core/src/stats.rs` | | Wakeup counters for the accept and discovery loops, discovery replies and sessions, plus process CPU time and thread count read from `/proc` |
 | `cli/src/main.rs` | `airlynx` | clap CLI: `send`, `receive`, `discover`, `favorite` |
@@ -68,6 +71,7 @@ Cargo workspace (edition 2024, resolver 3):
 | `app/src/platform.rs` | | Platform facade: desktop impl inline (rfd dialogs, `dirs`, `open`), Android re-exports `android.rs` |
 | `app/src/android.rs` | | JNI glue: device model, files shared from other apps, config dir, all-files-access check/request, multicast lock, status bar and navigation bar height, dark mode |
 | `app/src/browser.rs` | | In-app file browser (Android only) |
+| `app/src/remote.rs` | | The remote folder view opened by the folder button on a device card: folders, sizes, a **Get** button per file |
 | `app/src/diag.rs` | | Battery and wakeup diagnostics (Android only): the Settings > Diagnostics card and the optional once-a-minute logcat line |
 | `app/src/lib.rs` | | Module wiring and `android_main` entry point |
 | `app/src/main.rs` | | Desktop entry point |
@@ -104,7 +108,7 @@ speaks (`VERSION`); discovery does not carry the peer's own version. Times are r
 
 ---
 
-## Protocol (version 4)
+## Protocol (version 5)
 
 **Discovery** on UDP 47801. A device sends `AIRLYNX_DISCOVER <id>` (its 32-hex-digit device id) twice, three ways at once, because
 no single one works on every network:
@@ -135,16 +139,38 @@ sender                                       receiver
                                        <-    status u8   (0 ok, 2 rejected: version mismatch, ends the session)
                                        <-    public key [u8;32]   (only after status 0)
 ==== everything below is inside the encrypted stream ====
-sender id [u8;16] | name_len u8 | name ->
-                                       <-    status u8   (0 ok, 3 sender is not a favorite, 4 receiver cannot write to its save folder)
+sender id [u8;16] | name_len u8 | name | command u8 ->
+                                       <-    status u8   (0 ok, 2 unknown command, 3 sender is not a favorite,
+                                                           4 receiver cannot write to its save folder (SEND only))
+
+command 1, SEND:
 file count u32                         ->
 per file:
   name_len u16 | name (UTF-8) | size u64 | data | sha256[32]  ->
                                        <-    status u8   (0 ok, 1 hash mismatch)
+
+command 2, LIST (browse the receiver's save folder):
+path_len u16 | path (UTF-8)            ->
+                                       <-    status u8   (0 ok, 5 not found, 6 read error)
+                                       <-    entry count u32, per entry: kind u8 (0 file, 1 folder) | name_len u16 | name | size u64 | modified u64
+
+command 3, GET (download one file from it):
+path_len u16 | path (UTF-8)            ->
+                                       <-    status u8   (0 ok, 5 not found, 6 read error)
+                                       <-    size u64 | data | sha256[32]
 ```
 
+A session carries exactly one command. LIST and GET are why a device that has added you as a favorite can read its save folder
+("browse both ways" is just every device being both ends: each one answers and each one can ask). They are read only, and the
+path is "/" separated and relative to the save folder (empty for the folder itself). The owner answers `not found` for anything it
+will not show: `..`, names starting with a dot (which covers the `.part` files of transfers in progress), and anything whose real
+location (symlinks followed) is outside the folder. Listings skip hidden entries and symlinks, put folders first and are cut off at
+20,000 entries. A downloaded file is hash-checked and saved to the asker's own save folder as `name (1).ext` if the name is taken.
+Unlike SEND, they do not need the save folder to be writable. The app does not ask the owner for permission, same as a send from a
+favorite, so anyone who can pass as a favorite (see the trust model) can read everything in the folder.
+
 **Encryption:** both sides make a throwaway X25519 key pair per session and swap public keys in the handshake.
-Each direction gets its own ChaCha20-Poly1305 key, `SHA-256("airlynx v4 " | label | shared secret | sender pub | receiver pub)`.
+Each direction gets its own ChaCha20-Poly1305 key, `SHA-256("airlynx v5 " | label | shared secret | sender pub | receiver pub)`.
 After the handshake the stream is a series of records, `len u16 | ciphertext+tag`, with up to 16 KiB of plaintext each.
 The nonce is a per-direction record counter, so records can't be reordered, replayed or dropped unnoticed.
 Writes are buffered and flushed when a record fills, on `flush`, and before every read.
@@ -155,13 +181,13 @@ The receiver writes each file to a hidden `.<name>.<pid>.<n>.part` file and rena
 after the hash matches. Names are reduced to their last path component, so they can't escape
 the target directory.
 
-Status 4 was added without bumping `VERSION`: it replaces the OK after the hello, so an older sender that does not know it
+Status 4 was added in version 4 without bumping `VERSION`: it replaces the OK after the hello, so an older sender that does not know it
 stops with "receiver rejected the handshake" instead of a clear message, and nothing else changes. The receiver checks
 before every session (after the favorite check, so strangers learn nothing about its storage) that the save folder exists
 and a file can be created in it, so a folder that became unwritable while the app ran refuses the session before any file
 data is sent, and shows a "Transfer refused" entry in History.
 
-Changing the wire format means bumping `VERSION` in `core/src/protocol.rs`.
+The command byte after the hello is what made this version 5. Changing the wire format means bumping `VERSION` in `core/src/protocol.rs`.
 
 **Trust model:** the sender id is a plain identifier, not a secret. It is broadcast on the LAN, so a host that
 has seen it can claim to be that device. Favorites keep strangers and mistakes out, but they are not
@@ -178,6 +204,9 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
   from non-favorites, history), **Settings** (this device, save folder, file access, favorites with Remove).
   Window width picks the layout: 720 px or more gets a left sidebar and two columns on Send, anything narrower
   (all phones) gets a header and a bottom tab bar. The Android file browser replaces the page and hides the tab bar.
+- **Browsing a favorite:** an online favorite that has added this device shows a folder button next to Send. It opens that
+  device's save folder in place of the pages (tabs hidden, like the Android file picker): tap a folder to open it, **Up** to go back,
+  **Get** to download a file into this device's save folder. One download at a time. Not cancellable yet.
 - **Flow:** choose files, then press **Send** on an online, mutual favorite. While sending, that card shows the
   progress bar, byte counts and **Cancel**, and the other Send buttons are disabled. The result is a dismissible
   banner at the top of Send. The Received tab badge counts unseen files plus pending requests.
@@ -354,7 +383,7 @@ Rough priority order:
 2. **Android share target:** done (see the gotchas), including text. Open: a one-tap "send to the only online favorite"
    after a share, `SEND_MULTIPLE` on a real device, and moving from all-files access to the Storage Access Framework,
    which Play Store review prefers.
-3. **Security:** transfers are encrypted (v4) but not authenticated, and favorites are matched by an unauthenticated
+3. **Security:** transfers are encrypted (v4 and later) but not authenticated, and favorites are matched by an unauthenticated
    device id (see the trust model above), so a host on the LAN that learns a favorite's id can impersonate it, and an
    active man in the middle can read a session. Fix: a pairing step that exchanges a secret or public key when two
    devices favorite each other (for example a short code shown on both screens), then use it to authenticate the
@@ -367,6 +396,8 @@ Rough priority order:
 6. **Packaging:** a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.
 7. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
    and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
+8. **Browsing follow-ups:** an owner-side switch to turn sharing of the save folder off (now every favorite that has added you can read it),
+   cancelling a download, downloading a whole folder, and showing downloads in History. Not run on a device or looked at on a real screen yet.
 
 ### Icebox
 

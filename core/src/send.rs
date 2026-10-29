@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::identity::Identity;
 use crate::protocol::*;
-use crate::secure::Ephemeral;
+use crate::secure::{Ephemeral, SecureStream};
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -68,37 +68,7 @@ pub fn send_files(
     entries: &[Entry],
     mut on_progress: impl FnMut(&Progress) -> ControlFlow<()>,
 ) -> io::Result<Report> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-
-    let ephemeral = Ephemeral::new()?;
-    stream.write_all(MAGIC)?;
-    stream.write_all(&[VERSION])?;
-    stream.write_all(&ephemeral.public())?;
-    if read_u8(&mut stream)? != STATUS_OK {
-        return Err(invalid("receiver rejected the handshake (version mismatch?)"));
-    }
-    let mut peer_public = [0u8; 32];
-    stream.read_exact(&mut peer_public)?;
-    let mut stream = ephemeral.into_stream(stream, peer_public, true)?;
-
-    write_hello(&mut stream, me)?;
-    match read_u8(&mut stream)? {
-        STATUS_OK => {}
-        STATUS_NOT_FAVORITE => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the receiver has not added this device as a favorite",
-            ));
-        }
-        STATUS_NO_WRITE_ACCESS => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the receiver cannot write to its save folder",
-            ));
-        }
-        _ => return Err(invalid("receiver rejected the handshake")),
-    }
+    let mut stream = open_session(addr, me, COMMAND_SEND)?;
     stream.write_all(&(entries.len() as u32).to_be_bytes())?;
 
     let started = Instant::now();
@@ -141,6 +111,40 @@ pub fn send_files(
 
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+/// Connects to `addr`, runs the handshake and key exchange, introduces `me` and asks for `command`.
+/// Fails with `ErrorKind::PermissionDenied` if the other device refuses (not a favorite there, or for a send
+/// no write access to its save folder), and returns the encrypted stream once it said OK.
+pub(crate) fn open_session(addr: SocketAddr, me: &Identity, command: u8) -> io::Result<SecureStream<TcpStream>> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+    let ephemeral = Ephemeral::new()?;
+    stream.write_all(MAGIC)?;
+    stream.write_all(&[VERSION])?;
+    stream.write_all(&ephemeral.public())?;
+    if read_u8(&mut stream)? != STATUS_OK {
+        return Err(invalid("receiver rejected the handshake (version mismatch?)"));
+    }
+    let mut peer_public = [0u8; 32];
+    stream.read_exact(&mut peer_public)?;
+    let mut stream = ephemeral.into_stream(stream, peer_public, true)?;
+
+    write_hello(&mut stream, me)?;
+    stream.write_all(&[command])?;
+    match read_u8(&mut stream)? {
+        STATUS_OK => Ok(stream),
+        STATUS_NOT_FAVORITE => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the receiver has not added this device as a favorite",
+        )),
+        STATUS_NO_WRITE_ACCESS => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the receiver cannot write to its save folder",
+        )),
+        _ => Err(invalid("receiver rejected the handshake")),
+    }
 }
 
 /// Writes the file body to `stream` and returns its SHA-256.
