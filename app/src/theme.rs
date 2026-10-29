@@ -391,6 +391,7 @@ fn arc(center: Pos2, r: f32, from: f32, to: f32) -> Vec<Pos2> {
 #[derive(Clone, Copy, PartialEq)]
 pub enum Icon {
     Computer,
+    Macsplorer,
     Phone,
     Unknown,
     File,
@@ -421,6 +422,13 @@ impl Icon {
                 rounded(3.0, 4.0, 21.0, 16.0, 2.0);
                 line(&[(12.0, 16.0), (12.0, 20.0)]);
                 line(&[(8.0, 20.0), (16.0, 20.0)]);
+            }
+            Icon::Macsplorer => {
+                // A monitor with a folder on its screen.
+                rounded(3.0, 4.0, 21.0, 16.0, 2.0);
+                line(&[(12.0, 16.0), (12.0, 20.0)]);
+                line(&[(8.0, 20.0), (16.0, 20.0)]);
+                line(&[(7.0, 8.0), (7.0, 7.0), (10.0, 7.0), (11.0, 8.0), (17.0, 8.0), (17.0, 13.0), (7.0, 13.0), (7.0, 8.0)]);
             }
             Icon::Phone => {
                 rounded(7.0, 2.0, 17.0, 22.0, 2.5);

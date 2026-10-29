@@ -1138,6 +1138,7 @@ fn device_icon(kind: DeviceKind) -> Icon {
     match kind {
         DeviceKind::Desktop => Icon::Computer,
         DeviceKind::Mobile => Icon::Phone,
+        DeviceKind::Macsplorer => Icon::Macsplorer,
         DeviceKind::Unknown => Icon::Unknown,
     }
 }

@@ -261,6 +261,8 @@ mod tests {
         assert_eq!(peer.addr, "192.168.1.5:47800".parse().unwrap());
         assert_eq!((peer.id, peer.mutual, peer.name.as_str()), (id, true, "Living room Mac"));
         assert_eq!(peer.kind, DeviceKind::Desktop);
+        let peer = parse_announce(format!("{ANNOUNCE_PREFIX} 47800 {id} 0 x Mac").as_bytes(), from).unwrap();
+        assert_eq!(peer.kind, DeviceKind::Macsplorer);
         // Older formats lack the id or the kind and must not parse.
         assert!(parse_announce(b"AIRLYNX_HERE 47800 Old Mac", from).is_none());
         assert!(parse_announce(format!("{ANNOUNCE_PREFIX} 47800 {id} 1").as_bytes(), from).is_none());

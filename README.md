@@ -108,10 +108,11 @@ no single one works on every network:
    per asker, so it only supplies addresses and the UDP exchange below still decides who is a peer. This helps on networks
    that pass multicast but drop broadcast.
 
-The wire format of the question and the answer did not change (neither did the TCP protocol, so `VERSION` stays 4).
+The question and the answer keep their format (the answer only gained one more `kind` letter, which older builds ignore, and the TCP protocol did not change, so `VERSION` stays 4).
 Every other running device replies
-`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <kind d|m|?> <name>` to the asker's address. `kind` is `d` for a
-computer, `m` for a mobile device, `?` if unknown (shown as an icon next to favorites). `mutual` is 1 when the replier has
+`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <kind d|m|x|?> <name>` to the asker's address. `kind` is `d` for a
+computer, `m` for a mobile device, `x` for a computer running Macsplorer (shown with a monitor-and-folder icon), `?` if unknown (shown as an icon next to favorites).
+Builds from before `x` existed read it as `?`, so nothing breaks. `mutual` is 1 when the replier has
 the asker as a favorite. The asker drops replies carrying its own id and de-duplicates by id, so a device that answers on several interfaces or
 through several of the ways above is listed once.
 
