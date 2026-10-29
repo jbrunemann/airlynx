@@ -32,6 +32,7 @@ cargo run --release -p airlynx -- receive --dir ./received
 cargo run --release -p airlynx -- discover                  # lists id, address, favorite / has-you-as-favorite
 cargo run --release -p airlynx -- favorite add "Pixel"      # by name or id prefix; a full id works offline
 cargo run --release -p airlynx -- favorite list | remove <name>
+cargo run --release -p airlynx -- favorite info [name]      # address, port, route, has-you-as-favorite, first/last seen
 cargo run --release -p airlynx -- send a.jpg b.pdf --device Pixel   # or --to 192.168.1.20[:port]
 ```
 
@@ -54,7 +55,7 @@ Cargo workspace (edition 2024, resolver 3):
 | Path | Crate | Purpose |
 |------|-------|---------|
 | `core/src/protocol.rs` | `airlynx-core` | Constants (ports, magic, status codes), big-endian read helpers, handshake hello, `human_size` |
-| `core/src/identity.rs` | | `DeviceId`, `Identity`, `Favorites` (shared, persisted, reloads when the file changes on disk, plus the `addresses` cache: last IP per favorite), `Profile` (id + favorites in one directory) |
+| `core/src/identity.rs` | | `DeviceId`, `Identity`, `Favorites` (shared, persisted, reloads when the file changes on disk, plus the `addresses` cache: last IP per favorite, and the `seen` file behind `sighting()`), `Favorite::details` (the label/value rows of a details view, shared by the app and the CLI), `Profile` (id + favorites in one directory) |
 | `core/src/discovery.rs` | | `scan()` / `discover_with()` / `discover()` ask the network and collect `Peer`s (never including the caller): broadcast per interface, unicast to cached addresses and to mDNS finds. Responder thread used by the receiver |
 | `core/src/mdns.rs` | | `_airlynx._tcp` registration while receiving, and one browser thread per process that remembers the addresses it hears about (best effort, off if the daemon cannot start) |
 | `core/src/secure.rs` | | `Ephemeral` X25519 key exchange and `SecureStream`, an encrypted `Read + Write` wrapper (ChaCha20-Poly1305 records) |
@@ -91,6 +92,15 @@ The app rescans every 6 s, and a device stays "online" for 20 s after its last a
 Identity and favorites are stored in `<config dir>/AirLynx` on desktop (`~/Library/Application Support/AirLynx`
 on macOS) and in the app's private `files/config` on Android, as `device-id` and `favorites` text files.
 A `favorites` line is `<id> kind:<desktop|mobile|unknown> <name>`; older lines without `kind:` still load.
+`addresses` holds `<id> <ip>`. `seen` holds what the favorite details show besides the address, one line per favorite:
+`<id> <first> <last> <port|-> <mutual 0|1|-> <local ip|-> <interface|->` (Unix seconds, interface last because its name can
+hold spaces). A scan or an incoming session from a favorite updates it; a change of only the last-seen time is written at most once a minute,
+so the every-6-seconds scan does not write to flash. A favorite that only has an address (from before `seen` existed) shows its times as unknown.
+
+**Favorite details:** Settings > Favorites > **Info** (and `airlynx favorite info`) lists the short and full id, kind, status (app only),
+address, port, route, protocol, whether it has faved this device ("Faved you"), and first and last seen. The route is the local interface that
+shares a subnet with the favorite's address (`discovery::route_to`), or "through the gateway" if none does. The protocol row is the version this build
+speaks (`VERSION`); discovery does not carry the peer's own version. Times are relative ("3 days ago") because the UI has no local-time formatting.
 
 ---
 

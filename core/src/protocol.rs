@@ -111,3 +111,15 @@ pub fn human_size(bytes: u64) -> String {
         format!("{value:.1} {}", UNITS[unit])
     }
 }
+
+/// A time span as shown next to "seen": "just now", "5 min ago", "3 h ago", "2 days ago".
+pub fn human_age(secs: u64) -> String {
+    match secs {
+        0..10 => "just now".into(),
+        10..60 => format!("{secs}s ago"),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86400 => format!("{} h ago", secs / 3600),
+        86400..172800 => "1 day ago".into(),
+        _ => format!("{} days ago", secs / 86400),
+    }
+}

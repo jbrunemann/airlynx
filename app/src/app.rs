@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig, ReceiverHandle};
 use airlynx_core::send::{self, Entry, Progress, Report};
@@ -172,6 +172,8 @@ pub struct AirLynxApp {
     receiver_error: Option<String>,
     /// Why the last Open on the Received page did not work.
     open_error: Option<String>,
+    /// The favorite whose details are open in Settings.
+    info_open: Option<DeviceId>,
     last_scan: Instant,
     #[cfg(target_os = "android")]
     last_dir_check: Instant,
@@ -211,6 +213,7 @@ impl AirLynxApp {
             receiver: None,
             receiver_error: None,
             open_error: None,
+            info_open: None,
             last_scan: Instant::now(),
             #[cfg(target_os = "android")]
             last_dir_check: Instant::now(),
@@ -751,7 +754,7 @@ impl AirLynxApp {
                     ui.allocate_ui_with_layout(vec2(mid_w, 40.0), Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.add(egui::Label::new(RichText::new(&peer.name).family(theme::bold()).size(15.0)).truncate());
-                        theme::sub(ui, if peer.mutual { "Nearby, has added you" } else { "Nearby, not a favorite" });
+                        theme::sub(ui, if peer.mutual { "Nearby, faved you" } else { "Nearby" });
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if theme::button(ui, Kind::Secondary, None, "Add", true).clicked() {
@@ -794,7 +797,7 @@ impl AirLynxApp {
                         match live {
                             None => theme::status_line(ui, p.off, p.sub, "Offline"),
                             Some(peer) if peer.mutual => theme::status_line(ui, p.ok, p.ok, "Online"),
-                            Some(_) => theme::status_line(ui, p.warn, p.warn, "Has not added you yet"),
+                            Some(_) => theme::status_line(ui, p.warn, p.warn, "Not faved you"),
                         }
                     }
                 });
@@ -942,7 +945,7 @@ impl AirLynxApp {
 
     // ---- settings page ------------------------------------------------------------------------
 
-    fn settings_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, actions: &mut Actions) {
+    fn settings_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Shared, actions: &mut Actions) {
         let p = pal(ui);
 
         theme::section(ui, "This device", None);
@@ -1020,10 +1023,11 @@ impl AirLynxApp {
                         let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
                         ui.painter().rect_filled(line, 0.0, p.line);
                     }
+                    let open = self.info_open == Some(fav.id);
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         theme::tile(ui, device_icon(fav.kind), 36.0, Tint::Muted);
-                        let mid_w = (ui.available_width() - 90.0 - 12.0).max(40.0);
+                        let mid_w = (ui.available_width() - 140.0 - 12.0).max(40.0);
                         ui.allocate_ui_with_layout(vec2(mid_w, 36.0), Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.add(egui::Label::new(RichText::new(&fav.name).size(14.5)).truncate());
@@ -1033,8 +1037,14 @@ impl AirLynxApp {
                             if theme::button(ui, Kind::Danger, None, "Remove", true).clicked() {
                                 actions.remove_favorite = Some(fav.id);
                             }
+                            if theme::button(ui, Kind::Text, None, if open { "Hide" } else { "Info" }, true).clicked() {
+                                self.info_open = if open { None } else { Some(fav.id) };
+                            }
                         });
                     });
+                    if open {
+                        self.favorite_details(ui, s, fav);
+                    }
                 }
             });
         }
@@ -1051,6 +1061,34 @@ impl AirLynxApp {
             .small()
             .color(p.sub),
         );
+    }
+}
+
+impl AirLynxApp {
+    /// What is known about one favorite: where it is, how we reach it and when it was seen.
+    fn favorite_details(&self, ui: &mut egui::Ui, s: &Shared, fav: &airlynx_core::Favorite) {
+        let p = pal(ui);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let sighting = self.favorites.sighting(fav.id);
+        let mut rows = fav.details(sighting.as_ref(), now);
+        let status = match s.online(fav.id) {
+            None => "offline",
+            Some(peer) if peer.mutual => "online",
+            Some(_) => "online, not faved you",
+        };
+        rows.insert(1, ("Status", status.into()));
+        ui.add_space(4.0);
+        for (label, value) in rows {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.allocate_ui_with_layout(vec2(112.0, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_min_width(112.0);
+                    ui.label(RichText::new(label).size(13.0).color(p.sub));
+                });
+                ui.add(egui::Label::new(RichText::new(value).size(13.0)).wrap());
+            });
+        }
+        ui.add_space(4.0);
     }
 }
 
@@ -1341,7 +1379,7 @@ impl eframe::App for AirLynxApp {
                     match self.tab {
                         Tab::Send => self.send_page(ui, &ctx, &shared, wide, &mut actions),
                         Tab::Received => self.received_page(ui, &shared, &mut actions),
-                        Tab::Settings => self.settings_page(ui, &ctx, &mut actions),
+                        Tab::Settings => self.settings_page(ui, &ctx, &shared, &mut actions),
                     }
                     ui.add_space(12.0);
                 });

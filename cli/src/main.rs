@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig};
 use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, DeviceKind, Identity, Peer, Profile, human_size, scan, send};
@@ -72,6 +72,11 @@ enum FavoriteCommand {
         /// Seconds to wait for discovery replies
         #[arg(long, default_value_t = 2)]
         wait: u64,
+    },
+    /// Show what is known about favorites: address, port, route, last seen and so on (all of them without a name)
+    Info {
+        /// Favorite name or id (prefix)
+        device: Option<String>,
     },
     /// Remove a favorite, by name or id (prefix)
     Remove { device: String },
@@ -145,6 +150,27 @@ fn run(cli: Cli) -> io::Result<()> {
             println!("Added \"{}\" ({}) as a favorite", peer.name, peer.id.short());
             if !peer.mutual {
                 println!("They need to add this device too before files can be exchanged.");
+            }
+            Ok(())
+        }
+        Command::Favorite(FavoriteCommand::Info { device }) => {
+            let list = profile.favorites.list();
+            let chosen = match &device {
+                Some(query) => vec![pick(&list, query, |f| (f.id, &f.name))?],
+                None => list.iter().collect(),
+            };
+            if chosen.is_empty() {
+                println!("No favorites yet. Try `airlynx discover`, then `airlynx favorite add <name>`");
+            }
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            for (i, favorite) in chosen.into_iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                let sighting = profile.favorites.sighting(favorite.id);
+                for (label, value) in favorite.details(sighting.as_ref(), now) {
+                    println!("{label:<20}{value}");
+                }
             }
             Ok(())
         }

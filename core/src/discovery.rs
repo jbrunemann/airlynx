@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::identity::{DeviceId, DeviceKind, Favorites, Identity, clean_name};
+use crate::identity::{DeviceId, DeviceKind, Favorites, Identity, Route, clean_name};
 use crate::mdns;
 use crate::protocol::{ANNOUNCE_PREFIX, DISCOVER_PREFIX, DISCOVERY_PORT};
 use crate::stats;
@@ -187,14 +187,36 @@ fn discover_on(port: u16, me: &Identity, wait: Duration, hints: &[IpAddr]) -> io
     Ok(peers)
 }
 
-/// Like `discover_with`, using the last known address of every favorite, and remembering the
-/// addresses of the favorites it finds for next time.
+/// Like `discover_with`, using the last known address of every favorite, and remembering what it
+/// learns about the favorites it finds (address, port, route) for next time.
 pub fn scan(me: &Identity, favorites: &Favorites, wait: Duration) -> io::Result<Vec<Peer>> {
     let peers = discover_with(me, wait, &favorites.known_addresses())?;
     for peer in &peers {
-        favorites.remember_address(peer.id, peer.addr.ip());
+        if favorites.contains(peer.id) {
+            favorites.remember_peer(peer.id, peer.addr.ip(), peer.addr.port(), peer.mutual, route_to(peer.addr.ip()));
+        }
     }
     Ok(peers)
+}
+
+/// The interface that shares a subnet with `ip` (the most specific one if several do), or `None` when
+/// `ip` is not on a directly connected network and traffic goes through the default gateway.
+pub fn route_to(ip: IpAddr) -> Option<Route> {
+    let IpAddr::V4(ip) = ip else { return None };
+    let interfaces = if_addrs::get_if_addrs().ok()?;
+    interfaces
+        .iter()
+        .filter(|interface| !interface.is_loopback())
+        .filter_map(|interface| match &interface.addr {
+            if_addrs::IfAddr::V4(v4) if same_subnet(ip, v4.ip, v4.netmask) => Some((v4.prefixlen, interface.name.clone(), v4.ip)),
+            _ => None,
+        })
+        .max_by_key(|(prefix, ..)| *prefix)
+        .map(|(_, interface, local_ip)| Route { interface, local_ip })
+}
+
+fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, netmask: Ipv4Addr) -> bool {
+    u32::from(a) & u32::from(netmask) == u32::from(b) & u32::from(netmask)
 }
 
 /// The broadcast address of the subnet `ip` is in. On a /16 this reaches the other /24 ranges too,
@@ -274,6 +296,19 @@ mod tests {
         assert_eq!(directed_broadcast(ip("10.11.19.114"), ip("255.255.0.0")), ip("10.11.255.255"));
         assert_eq!(directed_broadcast(ip("192.168.1.20"), ip("255.255.255.0")), ip("192.168.1.255"));
         assert_eq!(directed_broadcast(ip("172.16.5.9"), ip("255.255.254.0")), ip("172.16.5.255"));
+    }
+
+    #[test]
+    fn subnets_follow_the_netmask() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert!(same_subnet(ip("10.11.19.114"), ip("10.11.46.85"), ip("255.255.0.0")));
+        assert!(!same_subnet(ip("10.11.19.114"), ip("10.11.46.85"), ip("255.255.255.0")));
+    }
+
+    #[test]
+    fn loopback_and_remote_addresses_have_no_route() {
+        assert_eq!(route_to(Ipv4Addr::LOCALHOST.into()), None);
+        assert_eq!(route_to("::1".parse().unwrap()), None);
     }
 
     #[test]

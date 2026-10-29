@@ -9,6 +9,6 @@ pub mod secure;
 pub mod send;
 pub mod stats;
 
-pub use discovery::{Peer, discover, discover_with, scan};
-pub use identity::{DeviceId, DeviceKind, Favorite, Favorites, Identity, Profile};
-pub use protocol::{DEFAULT_TCP_PORT, DISCOVERY_PORT, human_size};
+pub use discovery::{Peer, discover, discover_with, route_to, scan};
+pub use identity::{DeviceId, DeviceKind, Favorite, Favorites, Identity, Profile, Route, Sighting};
+pub use protocol::{DEFAULT_TCP_PORT, DISCOVERY_PORT, human_age, human_size};
