@@ -28,6 +28,8 @@ pub struct FileBrowser {
     items: Vec<Item>,
     selected: BTreeSet<PathBuf>,
     error: Option<String>,
+    /// Set when the directory changes so the next frame starts the list at the top.
+    scroll_to_top: bool,
 }
 
 impl FileBrowser {
@@ -38,6 +40,7 @@ impl FileBrowser {
             items: Vec::new(),
             selected: BTreeSet::new(),
             error: None,
+            scroll_to_top: false,
         };
         browser.refresh();
         browser
@@ -45,6 +48,7 @@ impl FileBrowser {
 
     fn open(&mut self, dir: &Path) {
         self.cwd = dir.to_path_buf();
+        self.scroll_to_top = true;
         self.refresh();
     }
 
@@ -101,7 +105,11 @@ impl FileBrowser {
         if let Some(err) = &self.error {
             ui.colored_label(pal(ui).err, err);
         }
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
+        if std::mem::take(&mut self.scroll_to_top) {
+            scroll = scroll.vertical_scroll_offset(0.0);
+        }
+        scroll.show(ui, |ui| {
             for item in &self.items {
                 if item.is_dir {
                     if folder_row(ui, &item.name).clicked() {
