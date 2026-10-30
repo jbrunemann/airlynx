@@ -30,7 +30,8 @@ winit = { version = "0.30.13", features = ["android-native-activity"] }
 package = "dev.airlynx.app"
 apk_name = "AirLynx"
 resources = "res"
-build_targets = ["aarch64-linux-android"]
+# armv7 is for TVs with a 32-bit userland (the Philips PUS8545 is one, as far as we know).
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
 
 [package.metadata.android.sdk]
 min_sdk_version = 30

@@ -23,9 +23,9 @@ It has not been tested on a physical phone yet.
 ./scripts/bundle-macos.sh && open target/release/AirLynx.app
 cargo run --release -p airlynx-app          # or run without bundling
 
-# Android APK (arm64, Android 11+)
-./scripts/build-apk.sh                      # -> target/release/apk/AirLynx.apk
-./scripts/build-apk.sh --install            # build + adb install
+# Android APK (Android 11+): AirLynx.apk (arm64) and AirLynx-armv7.apk (32-bit TVs)
+./scripts/build-apk.sh                      # -> target/release/apk/AirLynx.apk and AirLynx-armv7.apk
+./scripts/build-apk.sh --install            # build + adb install (the arm64 one)
 
 # Linux arm64 (CLI and desktop app): built by GitHub, see .github/workflows/linux-arm64.yml. Download the
 # airlynx-linux-arm64 artifact from the Actions run. Cross-compiled on x86 with gcc-aarch64-linux-gnu, so it needs
@@ -266,7 +266,8 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
   which draws a ring only after key input (not after a tap) and scrolls the widget into view. Back closes the file browser or the remote
   folder view, then returns to Send, then sends the app to the background (`moveTaskToBack`, the receiver keeps running). Not tried on a
   real TV yet, only the D-pad and Back keys on the phone emulator (`adb shell input keyevent KEYCODE_DPAD_DOWN`, `KEYCODE_BACK`).
-  The APK is arm64 only, so a TV with a 32-bit userland (for example the Chromecast with Google TV) cannot install it. Most TVs have no
+  There are two APKs, arm64 and armv7, because many TVs (the Philips PUS8545 is believed to be one) have a 32-bit userland;
+  the armv7 one has only been compiled and linted, never run. Most TVs have no
   screen for All files access, so grant it with `adb shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow`.
 - **Dark mode on Android** is read over JNI (see the gotchas). On desktop egui follows the system setting.
 
@@ -274,7 +275,7 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
 
 ## Toolchain and environment
 
-- Rust 1.95+, target `aarch64-linux-android`
+- Rust 1.95+, targets `aarch64-linux-android` and `armv7-linux-androideabi`
 - Android SDK at `~/Library/Android/sdk` (platform 34, build-tools 36, NDK 27.3), `cargo-apk` 0.10
 - The scripts default `ANDROID_HOME` to the path above and pick the newest NDK unless `ANDROID_NDK_ROOT` is set
 - Key versions: `eframe`/`egui` 0.37 (glow backend), `winit` 0.30.13, `jni` 0.21, `rfd` 0.17
@@ -456,7 +457,7 @@ Rough priority order:
 5. **UI follow-ups:** look at the desktop layout on a real screen and fix what is off, per-type file icons (every file
    uses the same tile), a gradient on the logo and progress bar (only the icon PNG has one), and an Unfavorite shortcut
    on the device card (it now lives only in Settings).
-6. **Packaging:** a release keystore, x86_64/armv7 Android targets, and a universal macOS binary.
+6. **Packaging:** a release keystore, an x86_64 Android target, and a universal macOS binary.
 7. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
    and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
 8. **Browsing follow-ups:** an owner-side switch to turn sharing of the save folder off (now every favorite that has added you can read it),
