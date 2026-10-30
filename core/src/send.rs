@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use crate::busy::Busy;
 use crate::identity::Identity;
 use crate::protocol::*;
 use crate::reverse;
@@ -69,6 +70,7 @@ pub fn send_files(
     entries: &[Entry],
     mut on_progress: impl FnMut(&Progress) -> ControlFlow<()>,
 ) -> io::Result<Report> {
+    let _busy = Busy::new();
     let mut stream = open_session(addr, me, COMMAND_SEND)?;
     stream.write_all(&(entries.len() as u32).to_be_bytes())?;
 

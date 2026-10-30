@@ -14,6 +14,7 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
+use crate::busy::Busy;
 use crate::identity::Identity;
 use crate::protocol::*;
 use crate::receive::{TMP_COUNTER, receive_file, sanitize_name, unique_path};
@@ -37,6 +38,7 @@ pub struct DirEntry {
 /// Lists the folder `path` ("" for the save folder itself) on the device at `addr`. Folders come first, then files,
 /// each sorted by name ignoring case. Fails with `ErrorKind::NotFound` if the path is not a folder there.
 pub fn list(addr: SocketAddr, me: &Identity, path: &str) -> io::Result<Vec<DirEntry>> {
+    let _busy = Busy::new();
     let mut stream = open_session(addr, me, COMMAND_LIST)?;
     write_path(&mut stream, path)?;
     read_status(&mut stream)?;
@@ -73,6 +75,7 @@ pub fn download(
 ) -> io::Result<PathBuf> {
     let name = sanitize_name(path)?;
     fs::create_dir_all(dest_dir)?;
+    let _busy = Busy::new();
     let mut stream = open_session(addr, me, COMMAND_GET)?;
     write_path(&mut stream, path)?;
     read_status(&mut stream)?;

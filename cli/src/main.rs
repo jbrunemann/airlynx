@@ -156,7 +156,6 @@ fn run(cli: Cli) -> io::Result<()> {
                 port,
                 identity: me,
                 favorites: profile.favorites,
-                poll_interval: receive::DEFAULT_POLL_INTERVAL,
                 reverse,
             })
         }

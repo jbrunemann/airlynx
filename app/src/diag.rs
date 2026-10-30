@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use airlynx_core::receive::DEFAULT_POLL_INTERVAL;
 use airlynx_core::stats::{self, Stats};
 
 use crate::android::{self, ExitRecord, Keep, PowerInfo};
@@ -68,12 +67,11 @@ pub struct Experiments {
     pub wake_lock: bool,
     pub wifi_lock: bool,
     pub multicast_lock: bool,
-    pub slow_poll: bool,
 }
 
 impl Default for Experiments {
     fn default() -> Self {
-        Self { receiver: true, wake_lock: true, wifi_lock: true, multicast_lock: true, slow_poll: false }
+        Self { receiver: true, wake_lock: true, wifi_lock: true, multicast_lock: true }
     }
 }
 
@@ -82,20 +80,15 @@ impl Experiments {
         Keep { wake_lock: self.wake_lock, wifi_lock: self.wifi_lock, multicast_lock: self.multicast_lock }
     }
 
-    pub fn poll_interval(&self) -> Duration {
-        if self.slow_poll { Duration::from_secs(1) } else { DEFAULT_POLL_INTERVAL }
-    }
-
     /// Compact and free of spaces, so a log line stays easy to split.
     fn label(&self) -> String {
         let flag = |on: bool| u8::from(on);
         format!(
-            "rx:{},wake:{},wifi:{},mcast:{},poll:{}",
+            "rx:{},wake:{},wifi:{},mcast:{}",
             flag(self.receiver),
             flag(self.wake_lock),
             flag(self.wifi_lock),
             flag(self.multicast_lock),
-            self.poll_interval().as_millis()
         )
     }
 }

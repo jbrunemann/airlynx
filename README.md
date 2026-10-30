@@ -91,8 +91,10 @@ Cargo workspace (edition 2024, resolver 3):
 All networking runs on background threads. They write into `Arc<Mutex<Shared>>` and call
 `ctx.request_repaint()`. The UI clones `Shared` each frame and records what the user did in an `Actions`
 value that is applied after drawing. One thread runs per scan, per send, and per incoming connection. The
-receiver also has an accept thread and a discovery responder thread, and both poll a stop flag.
-The app rescans every 6 s, and a device stays "online" for 20 s after its last answer.
+receiver also has an accept thread and a discovery responder thread. Both block until something arrives
+instead of polling (each wakeup costs a phone battery), so stopping the receiver sends each of them something over
+loopback. The app rescans every 6 s while its window has focus and shows the Send or Settings page, and every 60 s
+otherwise, since every scan wakes the devices that answer. A device stays "online" for 20 s after its last answer.
 
 Identity and favorites are stored in `<config dir>/AirLynx` on desktop (`~/Library/Application Support/AirLynx`
 on macOS) and in the app's private `files/config` on Android, as `device-id`, `favorites` and (optional) `device-name` text files.
@@ -204,7 +206,8 @@ phone                                        computer
 (handshake as above, phone is the TCP client)
 phone id | name | command 4, STANDBY   ->
                                        <-    status u8   (0 ok, 3 not a favorite)
-                                       <-    ping 0, answered by pong 0 from the phone, every 15 s
+                                       <-    ping 0, answered by pong 0 from the phone, every 60 s
+                                             (the phone gives up after 180 s of silence)
                                        <-    want 1 | token [u8;16], when the computer wants a session
 
 (on a want, the phone opens a second connection, handshake as above)
@@ -301,10 +304,10 @@ Each line is self-contained. `ts` is the Unix time, and `start_uah - uah` over `
 microampere-hours (`start_pct` and `pct` are the coarse version). Work out rates from `ts` or `wall_s`, which keep
 running while the phone sleeps. `awake_s` is the time the process could run, so `awake_s / wall_s` is how much of the time
 the phone was awake. `cpu_s` is CPU time since the baseline, and `accept_polls` / `discovery_polls` count loop
-wakeups (while awake). `uah` is `-` on devices that do not report it, and `current_raw` is in a device-specific unit and
+wakeups, which since the loops block are connections and packets that arrived. `uah` is `-` on devices that do not report it, and `current_raw` is in a device-specific unit and
 sign (this Galaxy reports milliamperes), so trust the charge counter. `event` says why the line was written: `start`,
 `tick` (a minute of real time passed), `screen` (the screen turned on or off) or `exp` (a switch changed). Without the
-wake lock the CPU sleeps for minutes at a time and lines only appear when it wakes, so use the `screen` lines as the
+wake lock (held only during a session now) the CPU sleeps for minutes at a time and lines only appear when it wakes, so use the `screen` lines as the
 start and end of each screen-off stretch. Runs are appended, and a `#` header line starts each one.
 
 The log also explains why it stopped. Each run starts with `# earlier exit` lines from Android's own record of how
@@ -321,21 +324,22 @@ the log as `airlynx-trace-<unix seconds>.txt` (`.pb` for a native crash), once p
 `trace=<file>`. Send that file off the device like the log: it shows what every thread was doing, so a spinning thread
 and a blocked one look different, and the frames in `libairlynx_app.so` point at the code.
 
-**Finding out which part costs battery:** the card has an Experiments section with five switches: receiver on (off is
-the control run: no service, no locks, no threads), CPU wake lock, Wi-Fi lock, multicast lock and slow polling (1 s
-instead of 0.1 s). Each change restarts the receiver and the baseline, and every log line records the combination as
-`exp=rx:1,wake:1,wifi:1,mcast:1,poll:100` along with the locks actually held. The switches are not saved, so a
+**Finding out which part costs battery:** the card has an Experiments section with four switches: receiver on (off is
+the control run: no service, no locks, no threads), CPU wake lock and Wi-Fi lock (both taken only while a session
+runs), and multicast lock (held the whole time). Each change restarts the receiver and the baseline, and every log line
+records the combination as `exp=rx:1,wake:1,wifi:1,mcast:1` along with the locks actually held. Logs from before
+the wake and Wi-Fi locks became per-session end the label with `,poll:100` and show `locks=wake+wifi+multicast` while idle;
+a first comparison (Galaxy S23, screen off) measured about 200 mA with all three held all the time against about 160 mA
+with none. The switches are not saved, so a
 restart goes back to everything on. A suggested sequence, with the phone unplugged and about 30 minutes per step
 (the charge counter moves in 3.7 mAh steps, so shorter runs are too coarse; the other phone activity is large, so
 differences under about 20 mAh/h will not show up):
 
-1. Receiver off (control), then everything on, then CPU wake lock off, 40 minutes or more each. Then try the Wi-Fi lock,
-   multicast lock and slow polling the same way. Finish with the control again to see whether the drain drifted.
+1. Receiver off (control), then everything on, 40 minutes or more each. Then try the multicast lock the same way. Finish with the control again to see whether the drain drifted.
 2. Wake the phone only to flip a switch, then lock it again and leave it alone. Compare the drain between a `screen`
    line that turned the screen off and the next `screen` line that turned it on.
-3. Send the file back and subtract each step's drain from the one before. Slow polling delays accepting a new
-   connection by up to a second, and the other switches can make discovery or the first transfer slower, so also
-   check that a send from the Mac still works in each state.
+3. Send the file back and subtract each step's drain from the one before. The switches can make discovery or the
+   first transfer slower, so also check that a send from the Mac still works in each state.
 
 For a baseline to compare against, run the same hour with the receiver stopped (close the app) and subtract. On the
 emulator the battery numbers are fake (it reports 100% and 900 mA) but the CPU and wakeup counters are real.
@@ -379,8 +383,10 @@ emulator the battery numbers are fake (it reports 100% and 900 mA) but the CPU a
 - **JNI calls** go through `android::with_env`, which attaches the thread and logs and clears Java exceptions.
   The `AndroidApp` is stored in a `OnceLock` by `android::init`.
 - **Receiving with the screen locked:** `android::set_keep_awake` starts `ReceiveService` (a `dataSync` foreground
-  service with an ongoing notification) and holds a partial wake lock, a Wi-Fi lock and a multicast lock while the receiver runs
-  (`android::set_keep` picks which, for the Diagnostics experiments).
+  service with an ongoing notification) and holds a multicast lock while the receiver runs. A partial wake lock and a Wi-Fi lock
+  are held only while a session runs, in either direction: `airlynx_core::busy` counts sessions (receiving, serving a listing or
+  download, a dial-back, sending, browsing) and calls `android::set_busy` when the first starts and the last ends. In between,
+  the phone sleeps and an incoming connection wakes it (`android::set_keep` picks which locks, for the Diagnostics experiments).
   cargo-apk 0.10 can neither ship Java nor declare a `<service>` or `<provider>`, so `build-apk.sh` compiles `app/java` with
   `javac` + `d8`, patches the generated manifest (`hasCode`, `<service>`, `<provider>`) and reassembles the APK with `aapt`,
   `zipalign` and `apksigner`. The service is addressed by name over JNI (a native thread's class loader can't see
@@ -412,8 +418,8 @@ Rough priority order:
 
 0. **Reverse connection (prototype).** Covered by a core test (`reverse::tests`: a fake phone dials a fake computer, which then
    lists, downloads and sends over the connection the phone opened). Not yet run with a real phone behind a NAT. Open points: the
-   phone wakes every 15 s for the ping while the app runs (measure it with the Diagnostics counters, a longer interval or TCP
-   keepalive may do), only the process that runs the receiver sees standby devices (a separate `airlynx send` process does not), the
+   phone wakes every 60 s for the ping while the app runs (was 15 s; a Mac on the old interval still works with a new phone,
+   but a new Mac pings an old phone too rarely and its standby connection drops every 45 s), only the process that runs the receiver sees standby devices (a separate `airlynx send` process does not), the
    dialer tries every favorite it knows an address for, including ones it could reach directly, and a Mac to Mac pair would work too
    (`receive --reverse`).
 1. **Test on a real phone and Mac on the same Wi-Fi**, especially discovery. Per-interface broadcast, the address cache

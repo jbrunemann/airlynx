@@ -15,8 +15,11 @@ use crate::platform;
 use crate::remote::{self, RemoteBrowser};
 use crate::theme::{self, Icon, Kind, Tint, pal};
 
-/// How often the network is scanned in the background.
+/// How often the network is scanned in the background while the window has focus and shows which devices
+/// are online (the Send and Settings pages).
 const SCAN_INTERVAL: Duration = Duration::from_secs(6);
+/// How often otherwise. Each scan wakes every device that answers, so this is long.
+const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(60);
 /// A device counts as online until it has been silent this long, so one lost
 /// UDP packet does not make a favorite flicker offline.
 const PEER_TTL: Duration = Duration::from_secs(20);
@@ -343,16 +346,11 @@ impl AirLynxApp {
                 return;
             }
         }
-        #[cfg(target_os = "android")]
-        let poll_interval = self.diag.experiments().poll_interval();
-        #[cfg(not(target_os = "android"))]
-        let poll_interval = receive::DEFAULT_POLL_INTERVAL;
         let config = ReceiverConfig {
             dir: self.receive_dir.clone(),
             port: DEFAULT_TCP_PORT,
             identity: self.identity.clone(),
             favorites: self.favorites.clone(),
-            poll_interval,
             // A phone is the device that tends to sit behind NAT or a VPN, so it opens the connections.
             reverse: cfg!(target_os = "android"),
         };
@@ -388,8 +386,12 @@ impl AirLynxApp {
         }
         #[cfg(target_os = "android")]
         self.take_shared_files();
+        // Every scan wakes the other devices (a phone's radio and CPU included), so scan often only while
+        // someone is looking at which devices are online.
+        let watching = ctx.input(|i| i.focused) && matches!(self.tab, Tab::Send | Tab::Settings) && !self.browsing();
+        let interval = if watching { SCAN_INTERVAL } else { IDLE_SCAN_INTERVAL };
         let scanning = self.shared.lock().unwrap().scanning;
-        if !scanning && self.last_scan.elapsed() >= SCAN_INTERVAL {
+        if !scanning && self.last_scan.elapsed() >= interval {
             self.start_scan(ctx, false);
         }
         #[cfg(target_os = "android")]
@@ -1226,10 +1228,9 @@ impl AirLynxApp {
             );
             ui.checkbox(&mut experiments.receiver, "Receiver on (off is the control run)");
             ui.add_enabled_ui(experiments.receiver, |ui| {
-                ui.checkbox(&mut experiments.wake_lock, "CPU wake lock");
-                ui.checkbox(&mut experiments.wifi_lock, "Wi-Fi high-performance lock");
+                ui.checkbox(&mut experiments.wake_lock, "CPU wake lock during transfers");
+                ui.checkbox(&mut experiments.wifi_lock, "Wi-Fi high-performance lock during transfers");
                 ui.checkbox(&mut experiments.multicast_lock, "Multicast lock");
-                ui.checkbox(&mut experiments.slow_poll, "Slow polling (1 s instead of 0.1 s)");
             });
         });
         if experiments != self.diag.experiments() {
@@ -1245,7 +1246,7 @@ impl AirLynxApp {
         platform::set_keep_awake(false);
         crate::android::set_keep(experiments.keep());
         self.start_receiver(ctx);
-        // Stopping the old receiver takes up to a couple of seconds, which should not count.
+        // Stopping the old receiver should not count.
         self.diag.reset();
     }
 }

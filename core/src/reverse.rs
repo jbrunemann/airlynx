@@ -19,17 +19,18 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::identity::{DeviceId, Favorites, Identity};
+use crate::busy::Busy;
 use crate::protocol::*;
 use crate::receive::{ReceiveEvent, serve_session};
 use crate::secure::SecureStream;
 use crate::send::{begin_session, connect};
+use crate::stop::Stop;
 
 /// Control bytes on a standby connection. The computer sends them, and the dialer answers a ping with a pong.
 const MSG_PING: u8 = 0;
@@ -37,12 +38,13 @@ const MSG_PONG: u8 = 0;
 /// Followed by the token of the connection the computer is waiting for.
 const MSG_WANT: u8 = 1;
 
-/// How often the computer checks that a standby connection is alive while nobody is asking for it.
-const PING_EVERY: Duration = Duration::from_secs(15);
+/// How often the computer checks that a standby connection is alive while nobody is asking for it. Every ping wakes
+/// the phone's radio and CPU, so this is long; a dead connection still shows within about a minute.
+const PING_EVERY: Duration = Duration::from_secs(60);
 /// How long it waits for the pong before it counts the device as gone.
 const PONG_WAIT: Duration = Duration::from_secs(10);
 /// How long the dialer waits for anything before it counts the computer as gone (three missed pings).
-const SILENCE_LIMIT: Duration = Duration::from_secs(45);
+const SILENCE_LIMIT: Duration = Duration::from_secs(180);
 /// How long a session waits for the dialer to open its connection.
 const ATTACH_WAIT: Duration = Duration::from_secs(10);
 
@@ -150,7 +152,7 @@ struct Dial {
     favorites: Favorites,
     dir: PathBuf,
     on_event: Arc<dyn Fn(ReceiveEvent) + Send + Sync>,
-    stop: Arc<AtomicBool>,
+    stop: Stop,
 }
 
 enum Slot {
@@ -166,12 +168,12 @@ pub(crate) fn spawn_dialer(
     favorites: Favorites,
     dir: PathBuf,
     on_event: Arc<dyn Fn(ReceiveEvent) + Send + Sync>,
-    stop: Arc<AtomicBool>,
+    stop: Stop,
 ) -> JoinHandle<()> {
     let dial = Arc::new(Dial { me, favorites, dir, on_event, stop });
     let slots: Arc<Mutex<HashMap<DeviceId, Slot>>> = Arc::default();
     thread::spawn(move || {
-        while !dial.stop.load(Ordering::Relaxed) {
+        while !dial.stop.is_set() {
             for favorite in dial.favorites.list() {
                 let Some(sighting) = dial.favorites.sighting(favorite.id) else { continue };
                 let addr = SocketAddr::new(sighting.ip, sighting.port.unwrap_or(DEFAULT_TCP_PORT));
@@ -191,10 +193,8 @@ pub(crate) fn spawn_dialer(
                     slots.lock().unwrap().insert(favorite.id, Slot::Wait(Instant::now() + wait));
                 });
             }
-            // Short sleeps, so that stopping is noticed quickly.
-            let until = Instant::now() + DIAL_CHECK;
-            while Instant::now() < until && !dial.stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(250));
+            if dial.stop.wait(DIAL_CHECK) {
+                break;
             }
         }
     })
@@ -215,7 +215,7 @@ fn stand_by(addr: SocketAddr, dial: &Arc<Dial>) -> (bool, io::Result<()>) {
 }
 
 fn listen(stream: &mut SecureStream<TcpStream>, addr: SocketAddr, dial: &Arc<Dial>) -> io::Result<()> {
-    while !dial.stop.load(Ordering::Relaxed) {
+    while !dial.stop.is_set() {
         match read_u8(stream)? {
             MSG_PING => {
                 stream.write_all(&[MSG_PONG])?;
@@ -236,6 +236,7 @@ fn listen(stream: &mut SecureStream<TcpStream>, addr: SocketAddr, dial: &Arc<Dia
 /// Opens the connection a session on the other side is waiting for, and answers that session over it.
 fn dial_back(addr: SocketAddr, token: Token, dial: &Dial) {
     let peer = addr.to_string();
+    let _busy = Busy::new();
     let result = (|| {
         let mut stream = connect(addr)?;
         begin_session(&mut stream, &dial.me, COMMAND_ATTACH, &token)?;
@@ -298,7 +299,7 @@ mod tests {
 
         // The phone knows where the computer is, and keeps a connection open to it.
         phone_favorites.remember_peer(mac.id, mac_addr.ip(), mac_addr.port(), true, None);
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Stop::default();
         let dialer = spawn_dialer(phone.clone(), phone_favorites, phone_dir.clone(), Arc::new(|_| {}), stop.clone());
         let standby = wait_for(|| standby_peers().into_iter().find(|p| p.id == phone.id));
         assert_eq!(standby.name, "Phone");
@@ -316,7 +317,7 @@ mod tests {
         assert_eq!(report.sent, ["note.txt"]);
         assert_eq!(fs::read(phone_dir.join("note.txt")).unwrap(), b"from the mac");
 
-        stop.store(true, Ordering::Relaxed);
+        stop.set();
         dialer.join().unwrap();
         let _ = fs::remove_dir_all(&base);
     }

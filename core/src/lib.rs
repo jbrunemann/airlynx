@@ -1,6 +1,7 @@
 //! AirLynx core: UDP and mDNS discovery, favorite devices, and a small TCP file-transfer protocol.
 
 pub mod browse;
+pub mod busy;
 pub mod discovery;
 pub mod identity;
 pub(crate) mod mdns;
@@ -10,6 +11,7 @@ pub(crate) mod reverse;
 pub mod secure;
 pub mod send;
 pub mod stats;
+pub(crate) mod stop;
 
 pub use discovery::{Peer, discover, discover_with, route_to, scan};
 pub use identity::{DeviceId, DeviceKind, Favorite, Favorites, Identity, Profile, Route, Sighting};

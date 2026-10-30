@@ -1,15 +1,16 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use crate::browse;
+use crate::busy::Busy;
 use crate::discovery;
 use crate::identity::{DeviceId, Favorites, Identity};
 use crate::mdns::{self, Advertisement};
@@ -17,16 +18,12 @@ use crate::protocol::*;
 use crate::reverse;
 use crate::secure::{Ephemeral, SecureStream};
 use crate::stats;
+use crate::stop::Stop;
 
 pub(crate) static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Emit a progress event roughly every this many bytes.
 const PROGRESS_STEP: u64 = 512 * 1024;
-
-/// How long the accept loop sleeps between checks. The discovery loop waits twice as long for a packet.
-/// Both only bound how quickly the receiver notices it was stopped, apart from the accept loop also
-/// delaying a new connection by up to this long. Longer means fewer wakeups, which saves battery.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ReceiverConfig {
@@ -35,7 +32,6 @@ pub struct ReceiverConfig {
     pub identity: Identity,
     /// Only these devices may send. Shared, so changes apply to the running receiver.
     pub favorites: Favorites,
-    pub poll_interval: Duration,
     /// Keep a connection open to every favorite we know the address of, so that it can start sessions with us even
     /// when we cannot be reached from its side (see `reverse`). Meant for a phone behind NAT or a VPN.
     pub reverse: bool,
@@ -64,7 +60,9 @@ pub enum ReceiveEvent {
 /// Transfers already in progress run to completion.
 pub struct ReceiverHandle {
     port: u16,
-    stop: Arc<AtomicBool>,
+    /// The discovery port, which the responder thread is blocked on.
+    discovery_port: u16,
+    stop: Stop,
     threads: Vec<JoinHandle<()>>,
     /// Keeps the mDNS registration alive (none if mDNS is unavailable).
     _advertisement: Option<Advertisement>,
@@ -80,7 +78,16 @@ impl ReceiverHandle {
     }
 
     fn shutdown(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        if self.threads.is_empty() {
+            return;
+        }
+        self.stop.set();
+        // The accept and discovery threads block until something arrives, rather than waking up to check
+        // for a stop, which costs battery. Send each of them something so they see it.
+        let _ = TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, self.port).into(), Duration::from_secs(1));
+        if let Ok(udp) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+            let _ = udp.send_to(b"", (Ipv4Addr::LOCALHOST, self.discovery_port));
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -100,11 +107,11 @@ pub fn start(
 ) -> io::Result<ReceiverHandle> {
     fs::create_dir_all(&config.dir)?;
     let listener = TcpListener::bind(("0.0.0.0", config.port))?;
-    listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
-    let udp = discovery::bind_responder(config.poll_interval * 2)?;
+    let udp = discovery::bind_responder()?;
+    let discovery_port = udp.local_addr()?.port();
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Stop::default();
     let responder = discovery::spawn_responder(
         udp,
         port,
@@ -119,14 +126,17 @@ pub fn start(
     let accept_stop = stop.clone();
     let dir = config.dir;
     let favorites = config.favorites;
-    let poll_interval = config.poll_interval;
     let dialer = config.reverse.then(|| {
         reverse::spawn_dialer(config.identity.clone(), favorites.clone(), dir.clone(), on_event.clone(), stop.clone())
     });
     let acceptor = thread::spawn(move || {
-        while !accept_stop.load(Ordering::Relaxed) {
+        loop {
+            let accepted = listener.accept();
             stats::accept_poll();
-            match listener.accept() {
+            if accept_stop.is_set() {
+                break;
+            }
+            match accepted {
                 Ok((stream, addr)) => {
                     stats::session();
                     let dir = dir.clone();
@@ -144,16 +154,15 @@ pub fn start(
                         }
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(poll_interval);
-                }
-                Err(_) => thread::sleep(poll_interval),
+                // Out of file descriptors and the like: don't spin.
+                Err(_) => thread::sleep(Duration::from_millis(200)),
             }
         }
     });
 
     Ok(ReceiverHandle {
         port,
+        discovery_port,
         stop,
         threads: [Some(responder), Some(acceptor), dialer].into_iter().flatten().collect(),
         _advertisement: advertisement,
@@ -175,8 +184,6 @@ pub(crate) fn handle_session(
     favorites: &Favorites,
     on_event: &(dyn Fn(ReceiveEvent) + Send + Sync),
 ) -> io::Result<Handled> {
-    // Accepted sockets can inherit the listener's non-blocking mode.
-    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let peer_addr = stream.peer_addr().ok();
 
@@ -267,6 +274,7 @@ pub(crate) fn serve_session(
         }
         return Ok(Handled::Reverse);
     }
+    let _busy = Busy::new();
     if let Some(ip) = peer_ip {
         favorites.remember_address(sender.id, ip);
     }
