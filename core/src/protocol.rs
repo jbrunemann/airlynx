@@ -24,13 +24,21 @@
 //!     path len: u16 | path: UTF-8
 //!                                             -> status byte, then if ok: size: u64 | data | sha256: [u8; 32]
 //!   Each session carries exactly one command.
+//!
+//! Reverse connections (see `reverse`), for a device that can reach us but that we cannot reach, for example
+//! because it sits behind NAT. The device dials us with the same handshake, hello and a command of its own:
+//!   command STANDBY: no payload. Status byte, then the connection stays open and carries control bytes:
+//!     we send PING (0) and it answers PONG (0), or we send WANT (1) | token: [u8; 16]
+//!   command ATTACH: token: [u8; 16]. Status byte (rejected if no session is waiting for that token).
+//!     After an OK the roles swap: we introduce ourselves with a hello and a command as above, and it answers as
+//!     the receiver, over this same connection.
 
 use std::io::{self, Read, Write};
 
 use crate::identity::{DeviceId, Identity, clean_name};
 
 pub const MAGIC: &[u8; 4] = b"ALNX";
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 
 pub const DEFAULT_TCP_PORT: u16 = 47800;
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -58,6 +66,10 @@ pub const STATUS_READ_ERROR: u8 = 6;
 pub const COMMAND_SEND: u8 = 1;
 pub const COMMAND_LIST: u8 = 2;
 pub const COMMAND_GET: u8 = 3;
+/// Sent by a device that wants to be asked for sessions over a connection it opened (see `reverse`).
+pub const COMMAND_STANDBY: u8 = 4;
+/// Sent by that device when asked: this connection is the one a waiting session should use.
+pub const COMMAND_ATTACH: u8 = 5;
 
 /// Entry kinds in a folder listing.
 pub const ENTRY_FILE: u8 = 0;

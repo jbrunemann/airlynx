@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::identity::{DeviceId, DeviceKind, Favorites, Identity, Route, clean_name};
 use crate::mdns;
 use crate::protocol::{ANNOUNCE_PREFIX, DISCOVER_PREFIX, DISCOVERY_PORT};
+use crate::reverse;
 use crate::stats;
 
 /// How often a running scan looks for addresses mDNS has found since it started.
@@ -188,12 +189,20 @@ fn discover_on(port: u16, me: &Identity, wait: Duration, hints: &[IpAddr]) -> io
 }
 
 /// Like `discover_with`, using the last known address of every favorite, and remembering what it
-/// learns about the favorites it finds (address, port, route) for next time.
+/// learns about the favorites it finds (address, port, route) for next time. A favorite that could not be found
+/// but has connected to us to be asked for sessions (see `reverse`) is listed too, at the address of that connection.
 pub fn scan(me: &Identity, favorites: &Favorites, wait: Duration) -> io::Result<Vec<Peer>> {
-    let peers = discover_with(me, wait, &favorites.known_addresses())?;
+    let mut peers = discover_with(me, wait, &favorites.known_addresses())?;
     for peer in &peers {
         if favorites.contains(peer.id) {
             favorites.remember_peer(peer.id, peer.addr.ip(), peer.addr.port(), peer.mutual, route_to(peer.addr.ip()));
+        }
+    }
+    for standby in reverse::standby_peers() {
+        if standby.id != me.id && !peers.iter().any(|p| p.id == standby.id) {
+            let kind = favorites.list().iter().find(|f| f.id == standby.id).map(|f| f.kind).unwrap_or_default();
+            // It dials favorites only, and we only accept a connection from one of ours, so it has us as a favorite.
+            peers.push(Peer { addr: standby.addr, id: standby.id, name: standby.name, mutual: true, kind });
         }
     }
     Ok(peers)

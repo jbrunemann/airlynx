@@ -6,6 +6,7 @@ pub mod identity;
 pub(crate) mod mdns;
 pub mod protocol;
 pub mod receive;
+pub(crate) mod reverse;
 pub mod secure;
 pub mod send;
 pub mod stats;

@@ -61,6 +61,7 @@ Cargo workspace (edition 2024, resolver 3):
 | `core/src/discovery.rs` | | `scan()` / `discover_with()` / `discover()` ask the network and collect `Peer`s (never including the caller): broadcast per interface, unicast to cached addresses and to mDNS finds. Responder thread used by the receiver |
 | `core/src/mdns.rs` | | `_airlynx._tcp` registration while receiving, and one browser thread per process that remembers the addresses it hears about (best effort, off if the daemon cannot start) |
 | `core/src/secure.rs` | | `Ephemeral` X25519 key exchange and `SecureStream`, an encrypted `Read + Write` wrapper (ChaCha20-Poly1305 records) |
+| `core/src/reverse.rs` | | Reverse connections: the standby registry on the asking side (`standby_peers`, `request`) and the dialer thread on the phone side (`spawn_dialer`), see the protocol section |
 | `core/src/send.rs` | | `prepare()` validates paths, `send_files()` streams them with a progress callback (`ControlFlow::Break` cancels), `resolve()` parses `host[:port]`, `open_session()` is the connect, handshake and hello shared by every command |
 | `core/src/browse.rs` | | Browsing a favorite's save folder: `list()` and `download()` for the asking side, `serve_list`/`serve_get` and the path checks for the owning side |
 | `core/src/receive.rs` | | `start()` returns a `ReceiverHandle` (stops on `stop()`/drop) and emits `ReceiveEvent`s; refuses non-favorites; filename sanitizing and `name (1).ext` dedup |
@@ -108,7 +109,7 @@ speaks (`VERSION`); discovery does not carry the peer's own version. Times are r
 
 ---
 
-## Protocol (version 5)
+## Protocol (version 6)
 
 **Discovery** on UDP 47801. A device sends `AIRLYNX_DISCOVER <id>` (its 32-hex-digit device id) twice, three ways at once, because
 no single one works on every network:
@@ -170,7 +171,7 @@ Unlike SEND, they do not need the save folder to be writable. The app does not a
 favorite, so anyone who can pass as a favorite (see the trust model) can read everything in the folder.
 
 **Encryption:** both sides make a throwaway X25519 key pair per session and swap public keys in the handshake.
-Each direction gets its own ChaCha20-Poly1305 key, `SHA-256("airlynx v5 " | label | shared secret | sender pub | receiver pub)`.
+Each direction gets its own ChaCha20-Poly1305 key, `SHA-256("airlynx v6 " | label | shared secret | sender pub | receiver pub)`.
 After the handshake the stream is a series of records, `len u16 | ciphertext+tag`, with up to 16 KiB of plaintext each.
 The nonce is a per-direction record counter, so records can't be reordered, replayed or dropped unnoticed.
 Writes are buffered and flushed when a record fills, on `flush`, and before every read.
@@ -187,7 +188,37 @@ before every session (after the favorite check, so strangers learn nothing about
 and a file can be created in it, so a folder that became unwritable while the app ran refuses the session before any file
 data is sent, and shows a "Transfer refused" entry in History.
 
-The command byte after the hello is what made this version 5. Changing the wire format means bumping `VERSION` in `core/src/protocol.rs`.
+The command byte after the hello is what made this version 5, and the reverse connection commands below (4 and 5) made it version 6.
+Changing the wire format means bumping `VERSION` in `core/src/protocol.rs`.
+
+**Reverse connection** (`core/src/reverse.rs`), for a device that can reach us but that we cannot reach back, for example a phone on a
+WireGuard VPN whose server masquerades its traffic: the Mac sees the phone only as the VPN host's address, so broadcast, mDNS and the
+cached address all fail in that direction. The phone (the dialer, `ReceiverConfig::reverse`, on by default on Android and `receive --reverse`
+in the CLI) keeps a standby connection open to every favorite whose address it has seen:
+
+```
+phone                                        computer
+(handshake as above, phone is the TCP client)
+phone id | name | command 4, STANDBY   ->
+                                       <-    status u8   (0 ok, 3 not a favorite)
+                                       <-    ping 0, answered by pong 0 from the phone, every 15 s
+                                       <-    want 1 | token [u8;16], when the computer wants a session
+
+(on a want, the phone opens a second connection, handshake as above)
+phone id | name | command 5, ATTACH | token [u8;16]  ->
+                                       <-    status u8   (0 ok, 2 no session is waiting for that token)
+==== from here the computer asks and the phone answers, over this connection ====
+                                       <-    computer id | name | command 1, 2 or 3 (as above)
+status u8, then the command goes on as above  ->
+```
+
+The standby connection also lists the phone in `scan()`, as a `Peer` whose address is where the connection came from (the VPN host and an
+ephemeral port, which says nothing about how to reach it, so it is not remembered). `send::open_session` looks that address up and asks
+for a connection instead of dialing, so `send_files`, `browse::list` and `browse::download` need no change. A device found the normal
+way is preferred over its standby entry. The computer accepts standby and attach from favorites only (a stranger gets the usual
+"not a favorite" request on the Received tab), and a token is good once, for ten seconds. A phone that loses the standby connection
+dials again after 10 s, and after 60 s if the computer did not answer. The trust model is unchanged: whoever passes as a favorite can
+register as the phone, and the computer would then send to it.
 
 **Trust model:** the sender id is a plain identifier, not a secret. It is broadcast on the LAN, so a host that
 has seen it can claim to be that device. Favorites keep strangers and mistakes out, but they are not
@@ -376,6 +407,12 @@ emulator the battery numbers are fake (it reports 100% and 900 mA) but the CPU a
 
 Rough priority order:
 
+0. **Reverse connection (prototype).** Covered by a core test (`reverse::tests`: a fake phone dials a fake computer, which then
+   lists, downloads and sends over the connection the phone opened). Not yet run with a real phone behind a NAT. Open points: the
+   phone wakes every 15 s for the ping while the app runs (measure it with the Diagnostics counters, a longer interval or TCP
+   keepalive may do), only the process that runs the receiver sees standby devices (a separate `airlynx send` process does not), the
+   dialer tries every favorite it knows an address for, including ones it could reach directly, and a Mac to Mac pair would work too
+   (`receive --reverse`).
 1. **Test on a real phone and Mac on the same Wi-Fi**, especially discovery. Per-interface broadcast, the address cache
    and mDNS are done and tested on one Mac (two CLI profiles) and the emulator, but only the CLI run exercised all three
    against a real peer. Still untested: a network that really drops broadcast, a phone on a hotspot, and macOS asking for

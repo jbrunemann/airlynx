@@ -348,6 +348,8 @@ impl AirLynxApp {
             identity: self.identity.clone(),
             favorites: self.favorites.clone(),
             poll_interval,
+            // A phone is the device that tends to sit behind NAT or a VPN, so it opens the connections.
+            reverse: cfg!(target_os = "android"),
         };
         let shared = self.shared.clone();
         let ctx = ctx.clone();

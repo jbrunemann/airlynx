@@ -33,6 +33,10 @@ enum Command {
         /// Name shown to senders (defaults to the hostname)
         #[arg(short, long)]
         name: Option<String>,
+        /// Keep a connection open to every favorite, so that it can start sessions with this device even when it
+        /// cannot reach it directly (for a device behind NAT or a VPN)
+        #[arg(long)]
+        reverse: bool,
     },
     /// Send one or more files to a favorite, or to an address
     Send {
@@ -145,7 +149,7 @@ fn run(cli: Cli) -> io::Result<()> {
         .with_kind(DeviceKind::Desktop);
 
     match cli.command {
-        Command::Receive { dir, port, name } => {
+        Command::Receive { dir, port, name, reverse } => {
             let me = name.map_or(me.clone(), |n| Identity::new(me.id, &n).with_kind(me.kind));
             run_receive(ReceiverConfig {
                 dir,
@@ -153,6 +157,7 @@ fn run(cli: Cli) -> io::Result<()> {
                 identity: me,
                 favorites: profile.favorites,
                 poll_interval: receive::DEFAULT_POLL_INTERVAL,
+                reverse,
             })
         }
         Command::Send { files, device, to, wait } => run_send(&profile, &me, files, device, to, Duration::from_secs(wait)),

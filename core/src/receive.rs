@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,7 +14,8 @@ use crate::discovery;
 use crate::identity::{DeviceId, Favorites, Identity};
 use crate::mdns::{self, Advertisement};
 use crate::protocol::*;
-use crate::secure::Ephemeral;
+use crate::reverse;
+use crate::secure::{Ephemeral, SecureStream};
 use crate::stats;
 
 pub(crate) static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +36,9 @@ pub struct ReceiverConfig {
     /// Only these devices may send. Shared, so changes apply to the running receiver.
     pub favorites: Favorites,
     pub poll_interval: Duration,
+    /// Keep a connection open to every favorite we know the address of, so that it can start sessions with us even
+    /// when we cannot be reached from its side (see `reverse`). Meant for a phone behind NAT or a VPN.
+    pub reverse: bool,
 }
 
 /// Everything a receiver reports. `peer` is the sender's "ip:port".
@@ -116,6 +120,9 @@ pub fn start(
     let dir = config.dir;
     let favorites = config.favorites;
     let poll_interval = config.poll_interval;
+    let dialer = config.reverse.then(|| {
+        reverse::spawn_dialer(config.identity.clone(), favorites.clone(), dir.clone(), on_event.clone(), stop.clone())
+    });
     let acceptor = thread::spawn(move || {
         while !accept_stop.load(Ordering::Relaxed) {
             stats::accept_poll();
@@ -128,10 +135,13 @@ pub fn start(
                     thread::spawn(move || {
                         let peer = addr.to_string();
                         let result = handle_session(stream, &dir, &peer, &favorites, &*on_event);
-                        on_event(ReceiveEvent::SessionEnded {
-                            peer,
-                            error: result.err().map(|e| e.to_string()),
-                        });
+                        // A standby or attach connection is not a transfer, and says nothing when it ends.
+                        if !matches!(result, Ok(Handled::Reverse)) {
+                            on_event(ReceiveEvent::SessionEnded {
+                                peer,
+                                error: result.err().map(|e| e.to_string()),
+                            });
+                        }
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -145,22 +155,30 @@ pub fn start(
     Ok(ReceiverHandle {
         port,
         stop,
-        threads: vec![responder, acceptor],
+        threads: [Some(responder), Some(acceptor), dialer].into_iter().flatten().collect(),
         _advertisement: advertisement,
     })
 }
 
-fn handle_session(
+/// What a connection turned out to be, for the caller deciding whether to report it.
+pub(crate) enum Handled {
+    /// A session that ran (or was refused), as far as it got.
+    Session,
+    /// A device asking to be kept on standby, or a connection it opened for a session we asked for (see `reverse`).
+    Reverse,
+}
+
+pub(crate) fn handle_session(
     mut stream: TcpStream,
     dir: &Path,
     peer: &str,
     favorites: &Favorites,
     on_event: &(dyn Fn(ReceiveEvent) + Send + Sync),
-) -> io::Result<()> {
+) -> io::Result<Handled> {
     // Accepted sockets can inherit the listener's non-blocking mode.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let peer_addr = stream.peer_addr().ok();
 
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic)?;
@@ -174,20 +192,63 @@ fn handle_session(
     let ephemeral = Ephemeral::new()?;
     stream.write_all(&[STATUS_OK])?;
     stream.write_all(&ephemeral.public())?;
-    let mut stream = ephemeral.into_stream(stream, peer_public, false)?;
+    let stream = ephemeral.into_stream(stream, peer_public, false)?;
+    serve_session(stream, peer_addr, true, dir, peer, favorites, on_event)
+}
+
+/// Answers one session on a connection that is past the key exchange. `accepted` is true if the other device
+/// opened the connection, which is the only case where it may ask for standby or attach. When the device on the other
+/// end got our attach (see `reverse`), it is the one who dialed and we are the one who asks, but the questions that
+/// get answered are the same, so this runs on that connection too.
+pub(crate) fn serve_session(
+    mut stream: SecureStream<TcpStream>,
+    peer_addr: Option<SocketAddr>,
+    accepted: bool,
+    dir: &Path,
+    peer: &str,
+    favorites: &Favorites,
+    on_event: &(dyn Fn(ReceiveEvent) + Send + Sync),
+) -> io::Result<Handled> {
+    let peer_ip: Option<IpAddr> = peer_addr.map(|a| a.ip());
 
     let sender = read_hello(&mut stream)?;
     let command = read_u8(&mut stream)?;
+    // An attach carries its token right after the command, before anything is answered.
+    let token = if accepted && command == COMMAND_ATTACH {
+        let mut token = [0u8; 16];
+        stream.read_exact(&mut token)?;
+        Some(token)
+    } else {
+        None
+    };
     if !favorites.contains(sender.id) {
         stream.write_all(&[STATUS_NOT_FAVORITE])?;
         stream.flush()?;
         on_event(ReceiveEvent::Refused { peer: peer.into(), id: sender.id, name: sender.name });
-        return Ok(());
+        return Ok(Handled::Session);
     }
-    if !matches!(command, COMMAND_SEND | COMMAND_LIST | COMMAND_GET) {
+    let known = match command {
+        COMMAND_SEND | COMMAND_LIST | COMMAND_GET => true,
+        COMMAND_STANDBY | COMMAND_ATTACH => accepted,
+        _ => false,
+    };
+    if !known {
         stream.write_all(&[STATUS_REJECTED])?;
         stream.flush()?;
         return Err(invalid(format!("unknown command {command}")));
+    }
+    if let Some(token) = token {
+        // Not one we are waiting for (it timed out, or was never ours): turn it away.
+        let Some(waiting) = reverse::take_waiting(token) else {
+            stream.write_all(&[STATUS_REJECTED])?;
+            stream.flush()?;
+            return Ok(Handled::Reverse);
+        };
+        stream.write_all(&[STATUS_OK])?;
+        stream.flush()?;
+        // The session is now ours to ask for, by whoever is waiting for this connection.
+        let _ = waiting.send(stream);
+        return Ok(Handled::Reverse);
     }
     // Say so before the sender streams any data, rather than failing halfway through the first file.
     // Only favorites get here, so a stranger learns nothing about this device's storage.
@@ -195,10 +256,17 @@ fn handle_session(
         stream.write_all(&[STATUS_NO_WRITE_ACCESS])?;
         stream.flush()?;
         on_event(ReceiveEvent::NotWritable { peer: peer.into(), error: e.to_string() });
-        return Ok(());
+        return Ok(Handled::Session);
     }
     stream.write_all(&[STATUS_OK])?;
     stream.flush()?;
+    if command == COMMAND_STANDBY {
+        // Its address is where it dialed from, which says nothing about how to reach it, so it is not remembered.
+        if let Some(addr) = peer_addr {
+            reverse::serve_standby(stream, addr, sender);
+        }
+        return Ok(Handled::Reverse);
+    }
     if let Some(ip) = peer_ip {
         favorites.remember_address(sender.id, ip);
     }
@@ -207,12 +275,12 @@ fn handle_session(
         COMMAND_LIST => {
             let path = browse::serve_list(&mut stream, dir)?;
             on_event(ReceiveEvent::Listed { peer: peer.into(), path });
-            return Ok(());
+            return Ok(Handled::Session);
         }
         COMMAND_GET => {
             let (path, size) = browse::serve_get(&mut stream, dir)?;
             on_event(ReceiveEvent::Served { peer: peer.into(), path, size });
-            return Ok(());
+            return Ok(Handled::Session);
         }
         _ => {}
     }
@@ -265,7 +333,7 @@ fn handle_session(
             });
         }
     }
-    Ok(())
+    Ok(Handled::Session)
 }
 
 /// Makes sure `dir` exists and a file can be created in it. Permissions can change while the receiver

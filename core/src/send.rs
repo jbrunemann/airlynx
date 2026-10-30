@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::identity::Identity;
 use crate::protocol::*;
+use crate::reverse;
 use crate::secure::{Ephemeral, SecureStream};
 
 #[derive(Debug, Clone)]
@@ -116,7 +117,15 @@ pub fn send_files(
 /// Connects to `addr`, runs the handshake and key exchange, introduces `me` and asks for `command`.
 /// Fails with `ErrorKind::PermissionDenied` if the other device refuses (not a favorite there, or for a send
 /// no write access to its save folder), and returns the encrypted stream once it said OK.
+/// If `addr` is a device that connected to us (see `reverse`), it is asked to dial back and the session runs over that.
 pub(crate) fn open_session(addr: SocketAddr, me: &Identity, command: u8) -> io::Result<SecureStream<TcpStream>> {
+    let mut stream = if reverse::is_standby(addr) { reverse::request(addr)? } else { connect(addr)? };
+    begin_session(&mut stream, me, command, &[])?;
+    Ok(stream)
+}
+
+/// Opens a TCP connection to `addr` and runs the handshake and key exchange.
+pub(crate) fn connect(addr: SocketAddr) -> io::Result<SecureStream<TcpStream>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
@@ -129,12 +138,22 @@ pub(crate) fn open_session(addr: SocketAddr, me: &Identity, command: u8) -> io::
     }
     let mut peer_public = [0u8; 32];
     stream.read_exact(&mut peer_public)?;
-    let mut stream = ephemeral.into_stream(stream, peer_public, true)?;
+    ephemeral.into_stream(stream, peer_public, true)
+}
 
-    write_hello(&mut stream, me)?;
+/// Introduces `me`, asks for `command` (with its `payload`, if it has one) and waits for the OK. Which side opened the
+/// connection does not matter here: a device that dialed us introduces itself the same way (see `reverse`).
+pub(crate) fn begin_session(
+    stream: &mut SecureStream<TcpStream>,
+    me: &Identity,
+    command: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    write_hello(stream, me)?;
     stream.write_all(&[command])?;
-    match read_u8(&mut stream)? {
-        STATUS_OK => Ok(stream),
+    stream.write_all(payload)?;
+    match read_u8(stream)? {
+        STATUS_OK => Ok(()),
         STATUS_NOT_FAVORITE => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "the receiver has not added this device as a favorite",
