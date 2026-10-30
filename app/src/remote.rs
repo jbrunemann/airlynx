@@ -267,6 +267,7 @@ impl RemoteBrowser {
                         });
                         if entry.is_dir {
                             let tap = ui.interact(row.response.rect, row.response.id.with("open"), Sense::click());
+                            theme::focus_ring(ui, &tap, 12);
                             if tap.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                 nav = Some(Nav::Enter(entry.name.clone()));
                             }

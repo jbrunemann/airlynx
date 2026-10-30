@@ -1,0 +1,43 @@
+name: Linux arm64
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Cross-compiled from x86 so it runs on every plan (native arm runners are not free for private repos).
+    # 22.04 on purpose: the binaries need at most glibc 2.35, so they also run on Raspberry Pi OS and Debian 12.
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the arm64 cross linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-gnu && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-unknown-linux-gnu
+
+      - name: Build the CLI and the desktop app
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p airlynx -p airlynx-app
+
+      - name: Package
+        run: |
+          out=airlynx-linux-arm64
+          mkdir "$out"
+          cp target/aarch64-unknown-linux-gnu/release/airlynx target/aarch64-unknown-linux-gnu/release/airlynx-app "$out"/
+          tar czf "$out.tar.gz" "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlynx-linux-arm64
+          path: airlynx-linux-arm64.tar.gz

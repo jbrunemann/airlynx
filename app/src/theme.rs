@@ -148,6 +148,37 @@ pub fn install(ctx: &egui::Context) {
     }
 }
 
+const KEY_NAV: egui::Id = egui::Id::NULL;
+
+/// Remembers whether the last input came from keys (the D-pad of a TV remote, Tab) or from touch or the mouse.
+/// Focus rings show only after keys, so a tapped button does not keep one.
+pub fn track_input(ctx: &egui::Context) {
+    use egui::{Event, Key};
+    let keys = ctx.input(|i| {
+        i.events.iter().rev().find_map(|e| match e {
+            Event::Key { pressed: true, key: Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Tab | Key::Enter, .. } => Some(true),
+            Event::PointerButton { pressed: true, .. } | Event::Touch { .. } => Some(false),
+            _ => None,
+        })
+    });
+    if let Some(keys) = keys {
+        ctx.data_mut(|d| d.insert_temp(KEY_NAV, keys));
+    }
+}
+
+/// Outlines a widget that has keyboard focus, and scrolls it into view when focus has just moved onto it.
+/// Call after the widget is painted, so the ring is on top.
+pub fn focus_ring(ui: &Ui, response: &Response, radius: u8) {
+    if !response.has_focus() || !ui.ctx().data(|d| d.get_temp::<bool>(KEY_NAV)).unwrap_or(false) {
+        return;
+    }
+    if response.gained_focus() {
+        response.scroll_to_me(None);
+    }
+    let rect = response.rect.expand(2.0);
+    ui.painter().rect_stroke(rect, CornerRadius::same(radius + 2), Stroke::new(2.5, pal(ui).accent), StrokeKind::Outside);
+}
+
 /// Touch-sized controls on the phone, a little tighter on the desktop.
 pub fn control_height() -> f32 {
     if cfg!(target_os = "android") { 44.0 } else { 38.0 }
@@ -266,6 +297,7 @@ pub fn button(ui: &mut Ui, kind: Kind, icon: Option<Icon>, label: &str, enabled:
         }
         painter.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, fg);
     }
+    focus_ring(ui, &response, 12);
     if enabled {
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
@@ -284,6 +316,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
         ui.painter().rect_filled(rect, CornerRadius::same(10), p.accent_soft);
     }
     icon.paint(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), color, 2.0);
+    focus_ring(ui, &response, 10);
     response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
 }
 

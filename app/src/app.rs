@@ -197,6 +197,10 @@ pub struct AirLynxApp {
 impl AirLynxApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
+        if platform::is_tv() {
+            // Read from the couch: everything a little bigger.
+            cc.egui_ctx.set_zoom_factor(1.4);
+        }
         #[cfg(target_os = "android")]
         sync_theme(&cc.egui_ctx);
 
@@ -378,6 +382,34 @@ impl AirLynxApp {
 
     /// Background upkeep: periodic scans, and on Android picking up a changed save folder
     /// once the user has granted file access, and a changed light/dark setting.
+    /// The remote of an Android TV: egui moves focus from the focused widget, so the first arrow press (with nothing
+    /// focused yet) takes the first widget, and Back steps out of a view, then to the Send page, then leaves the app.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        theme::track_input(ctx);
+        let (arrow, back) = ctx.input(|i| {
+            let arrow = [egui::Key::ArrowUp, egui::Key::ArrowDown, egui::Key::ArrowLeft, egui::Key::ArrowRight].into_iter().any(|k| i.key_pressed(k));
+            (arrow, i.key_pressed(egui::Key::BrowserBack))
+        });
+        if arrow && ctx.memory(|m| m.focused()).is_none() {
+            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::Next));
+        }
+        if !back {
+            return;
+        }
+        #[cfg(target_os = "android")]
+        if self.browser.take().is_some() {
+            return;
+        }
+        if self.remote.take().is_some() {
+            return;
+        }
+        if self.tab == Tab::Send {
+            platform::go_home();
+        } else {
+            self.tab = Tab::Send;
+        }
+    }
+
     fn tick(&mut self, ctx: &egui::Context) {
         let delivered = std::mem::take(&mut self.shared.lock().unwrap().delivered);
         if !delivered.is_empty() {
@@ -549,6 +581,7 @@ impl AirLynxApp {
                     if tab == Tab::Received && unseen > 0 {
                         badge(ui, egui::pos2(pill.right() - 6.0, pill.top() + 1.0), unseen);
                     }
+                    theme::focus_ring(ui, &response, 14);
                     if response.clicked() {
                         self.tab = tab;
                     }
@@ -587,6 +620,7 @@ impl AirLynxApp {
                     if tab == Tab::Received && unseen > 0 {
                         badge(ui, rect.right_center() - vec2(20.0, 0.0), unseen);
                     }
+                    theme::focus_ring(ui, &response, 10);
                     if response.clicked() {
                         self.tab = tab;
                     }
@@ -1079,9 +1113,12 @@ impl AirLynxApp {
                 if platform::has_all_files_access() {
                     ui.label(RichText::new("Allowed").size(13.0).family(theme::bold()).color(p.ok));
                 } else {
-                    ui.label(RichText::new("Grant file access to save into Download/AirLynx instead.").size(13.0).color(p.sub));
+                    ui.label(RichText::new("Received files are hidden in Android/data until you grant file access. Grant it to save into Download/AirLynx instead.").size(13.0).color(p.sub));
                     if theme::button(ui, Kind::Secondary, None, "Grant file access", true).clicked() {
                         platform::request_all_files_access();
+                    }
+                    if platform::is_tv() {
+                        ui.label(RichText::new("Most TVs have no screen for this. From a computer: adb shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow").size(13.0).color(p.sub));
                     }
                 }
             }
@@ -1357,6 +1394,7 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
             }
         }
         ReceiveEvent::FileSaved { peer, path, size } => {
+            platform::scan_file(&path);
             s.incoming.retain(|i| i.peer != peer);
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let from = s.name_for(&peer);
@@ -1394,6 +1432,7 @@ impl eframe::App for AirLynxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.tick(&ctx);
+        self.handle_keys(&ctx);
 
         #[cfg(not(target_os = "android"))]
         {

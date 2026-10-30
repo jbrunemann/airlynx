@@ -38,6 +38,17 @@ mod desktop {
     /// Android only: runs a foreground service and holds wake/Wi-Fi locks so receiving works with the screen locked.
     pub fn set_keep_awake(_on: bool) {}
 
+    /// Android TV only: whether the app runs on a television, driven by a remote.
+    pub fn is_tv() -> bool {
+        false
+    }
+
+    /// Android only: sends the app to the background, like the Home button.
+    pub fn go_home() {}
+
+    /// Android only: adds a saved file to the media index.
+    pub fn scan_file(_path: &Path) {}
+
     /// Android only: deletes the copy made of a file shared from another app.
     pub fn discard_copy(_path: &Path) {}
 

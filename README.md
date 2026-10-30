@@ -27,6 +27,10 @@ cargo run --release -p airlynx-app          # or run without bundling
 ./scripts/build-apk.sh                      # -> target/release/apk/AirLynx.apk
 ./scripts/build-apk.sh --install            # build + adb install
 
+# Linux arm64 (CLI and desktop app): built by GitHub, see .github/workflows/linux-arm64.yml. Download the
+# airlynx-linux-arm64 artifact from the Actions run. Cross-compiled on x86 with gcc-aarch64-linux-gnu, so it needs
+# glibc 2.35 or newer and, for the app, libxkbcommon and libGL (or Wayland/X11 libs) on the target. Not run on a real arm board yet.
+
 # CLI (same profile as the desktop app unless --config-dir is given)
 cargo run --release -p airlynx -- receive --dir ./received
 cargo run --release -p airlynx -- discover                  # lists id, address, favorite / has-you-as-favorite
@@ -255,6 +259,15 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
 - **Fonts:** Inter Regular and SemiBold from `assets/fonts/` replace egui's thin default text font. Headings, names
   and button labels use the `theme::bold()` family. The mockups the design came from were made on a Claude Design canvas
   and are not in the repo.
+- **Android TV:** the same APK runs on a TV (`LEANBACK_LAUNCHER` filter and a banner in the manifest, touchscreen, leanback and portrait
+  declared optional). `android::is_tv()` (UI mode TELEVISION) zooms the UI to 1.4 and `MainActivity` switches it to landscape. The remote's
+  D-pad arrives as arrow keys and Enter, which egui turns into focus moves and clicks. egui only moves focus from a widget that already
+  has it, so `AirLynxApp::handle_keys` focuses the first widget on the first arrow press. The custom-painted widgets call `theme::focus_ring`,
+  which draws a ring only after key input (not after a tap) and scrolls the widget into view. Back closes the file browser or the remote
+  folder view, then returns to Send, then sends the app to the background (`moveTaskToBack`, the receiver keeps running). Not tried on a
+  real TV yet, only the D-pad and Back keys on the phone emulator (`adb shell input keyevent KEYCODE_DPAD_DOWN`, `KEYCODE_BACK`).
+  The APK is arm64 only, so a TV with a 32-bit userland (for example the Chromecast with Google TV) cannot install it. Most TVs have no
+  screen for All files access, so grant it with `adb shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow`.
 - **Dark mode on Android** is read over JNI (see the gotchas). On desktop egui follows the system setting.
 
 ---
@@ -394,6 +407,10 @@ emulator the battery numbers are fake (it reports 100% and 900 mA) but the CPU a
   service still runs but the notification is hidden. The service stops when the app exits. Verified on the API 34
   emulator with the screen asleep; not on a physical phone yet. Android 15 limits `dataSync` services to 6 h
   per day once targetSdk is 35.
+- **cargo-apk drops its launcher filter** as soon as `Cargo.toml` declares any `MAIN` intent filter. `app/Cargo.toml` therefore lists
+  `LAUNCHER` and `LEANBACK_LAUNCHER` together in one filter. Without it the app has no launcher icon, and `ReceiveService` crashes
+  because `getLaunchIntentForPackage` returns null. `aapt` also adds `android.hardware.screen.portrait` as required because of the portrait
+  lock, which makes a TV refuse the install, so it is declared `required = false`.
 - **Share target (`MainActivity`):** cargo-apk can set the activity class and launch mode (`name`, `launch_mode` in `app/Cargo.toml`)
   and add intent filters (`SEND`, `SEND_MULTIPLE`, `*/*`), so the manifest needs no patch for it. It must be `singleTask`:
   a share while the app runs then arrives in `onNewIntent`, instead of starting a second NativeActivity (and a second

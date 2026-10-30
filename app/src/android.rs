@@ -171,6 +171,32 @@ pub fn has_all_files_access() -> bool {
     .unwrap_or(false)
 }
 
+/// Whether the device is a television (UI mode type TELEVISION): no touch screen, a remote with a D-pad.
+pub fn is_tv() -> bool {
+    static TV: OnceLock<bool> = OnceLock::new();
+    *TV.get_or_init(|| {
+        with_env(|env, activity| env.call_method(activity, "isTelevision", "()Z", &[])?.z()).unwrap_or(false)
+    })
+}
+
+/// Moves the task to the back, like Home. The receiver keeps running in its foreground service, so this is
+/// what Back does on the first page instead of finishing the activity.
+pub fn go_home() {
+    with_env(|env, activity| {
+        env.call_method(activity, "moveTaskToBack", "(Z)Z", &[JValue::Bool(1)])?;
+        Ok(())
+    });
+}
+
+/// Adds a saved file to Android's media index so file managers' Downloads and Recent views list it.
+pub fn scan_file(path: &Path) {
+    with_env(|env, activity| {
+        let path = env.new_string(path.to_string_lossy())?;
+        env.call_method(activity, "scanFile", "(Ljava/lang/String;)V", &[JValue::Object(&path)])?;
+        Ok(())
+    });
+}
+
 /// Opens a received file in whichever app handles its type. `MainActivity::openFile` hands the other app a
 /// content:// URI from `ReceivedFilesProvider`, and returns why it could not, if it could not.
 pub fn open_file(path: &Path) -> Result<(), String> {
