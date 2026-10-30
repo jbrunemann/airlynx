@@ -791,49 +791,52 @@ impl AirLynxApp {
         };
         let border = target.map(|_| p.accent);
         theme::card(ui, border, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 theme::tile(ui, device_icon(kind), 44.0, if live.is_some() { Tint::Accent } else { Tint::Muted });
                 let can_browse = target.is_none() && live.is_some_and(|peer| peer.mutual);
-                let buttons_w = 92.0 + if can_browse { theme::control_height() + 12.0 } else { 0.0 };
-                let mid_w = (ui.available_width() - buttons_w - 12.0).max(40.0);
-                ui.allocate_ui_with_layout(vec2(mid_w, 44.0), Layout::top_down(Align::Min), |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                // The name gets the full width next to the tile. The status and the buttons share the row below.
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
                     let name_color = if live.is_some() { p.text } else { p.sub };
                     ui.add(egui::Label::new(RichText::new(&fav.name).family(theme::bold()).size(15.5).color(name_color)).truncate());
-                    if let Some(progress) = target {
-                        ui.label(
-                            RichText::new(format!("Sending, file {} of {}", progress.file_index + 1, progress.file_count))
-                                .size(13.0)
-                                .color(p.accent_text),
-                        );
-                    } else {
-                        match live {
-                            None => theme::status_line(ui, p.off, p.sub, "Offline"),
-                            Some(peer) if peer.mutual => theme::status_line(ui, p.ok, p.ok, "Online"),
-                            Some(_) => theme::status_line(ui, p.warn, p.warn, "Not faved you"),
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(theme::control_height());
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if let Some(progress) = target {
+                            ui.label(
+                                RichText::new(format!("Sending, file {} of {}", progress.file_index + 1, progress.file_count))
+                                    .size(13.0)
+                                    .color(p.accent_text),
+                            );
+                        } else {
+                            match live {
+                                None => theme::status_line(ui, p.off, p.sub, "Offline"),
+                                Some(peer) if peer.mutual => theme::status_line(ui, p.ok, p.ok, "Online"),
+                                Some(_) => theme::status_line(ui, p.warn, p.warn, "Not faved you"),
+                            }
                         }
-                    }
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if target.is_some() {
-                        if theme::button(ui, Kind::Secondary, None, "Cancel", true).clicked() {
-                            self.cancel.store(true, Ordering::Relaxed);
-                        }
-                    } else {
-                        let can_send = !sending && !self.files.is_empty() && live.is_some_and(|peer| peer.mutual);
-                        if theme::button(ui, Kind::Primary, Some(Icon::Send), "Send", can_send).clicked()
-                            && let Some(peer) = live
-                        {
-                            actions.send_to = Some((peer.addr, fav.name.clone(), fav.id));
-                        }
-                        if can_browse
-                            && theme::icon_button(ui, Icon::Folder, "Browse files").clicked()
-                            && let Some(peer) = live
-                        {
-                            actions.browse = Some((peer.addr, fav.name.clone()));
-                        }
-                    }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if target.is_some() {
+                                if theme::button(ui, Kind::Secondary, None, "Cancel", true).clicked() {
+                                    self.cancel.store(true, Ordering::Relaxed);
+                                }
+                            } else {
+                                let can_send = !sending && !self.files.is_empty() && live.is_some_and(|peer| peer.mutual);
+                                if theme::button(ui, Kind::Primary, Some(Icon::Send), "Send", can_send).clicked()
+                                    && let Some(peer) = live
+                                {
+                                    actions.send_to = Some((peer.addr, fav.name.clone(), fav.id));
+                                }
+                                if can_browse
+                                    && theme::icon_button(ui, Icon::Folder, "Browse files").clicked()
+                                    && let Some(peer) = live
+                                {
+                                    actions.browse = Some((peer.addr, fav.name.clone()));
+                                }
+                            }
+                        });
+                    });
                 });
             });
             if let Some(progress) = target {
@@ -1328,6 +1331,11 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
 fn sync_theme(ctx: &egui::Context) {
     if let Some(dark) = platform::is_dark_mode() {
         ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+        // Only on a change: the call goes through the UI thread.
+        static LAST: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+        if LAST.swap(dark as i8, Ordering::Relaxed) != dark as i8 {
+            platform::set_system_bar_icons(dark);
+        }
     }
 }
 

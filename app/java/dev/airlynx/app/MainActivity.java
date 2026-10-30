@@ -9,6 +9,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
+import android.view.WindowInsetsController;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -54,6 +55,26 @@ public class MainActivity extends NativeActivity {
     }
 
     // ---- called from native code ------------------------------------------------------------
+
+    /**
+     * Makes the status and navigation bar icons readable on the app's background. The app draws its own
+     * light or dark palette under the bars, but Android picks the icon color from its own theme.
+     * lightBackground is true when the app is in light mode, which needs dark icons.
+     */
+    public void setSystemBarIcons(final boolean lightBackground) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WindowInsetsController controller = getWindow().getInsetsController();
+                if (controller == null) {
+                    return;
+                }
+                int mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(lightBackground ? mask : 0, mask);
+            }
+        });
+    }
 
     /** Paths of the files copied since the last call. */
     public synchronized String[] takeSharedFiles() {

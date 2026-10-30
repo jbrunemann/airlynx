@@ -564,6 +564,15 @@ pub fn is_dark_mode() -> Option<bool> {
     })
 }
 
+/// Tells Android whether the app is drawing a light or dark background under the system bars, so it
+/// picks dark or light icons. Without this the icons follow Android's own theme and can match the app.
+pub fn set_system_bar_icons(dark_mode: bool) {
+    with_env(|env, activity| {
+        env.call_method(activity, "setSystemBarIcons", "(Z)V", &[JValue::Bool((!dark_mode).into())])?;
+        Ok(())
+    });
+}
+
 /// Height of the navigation bar (or gesture bar) in physical pixels. NativeActivity draws
 /// underneath it as well. Zero until the window is attached.
 pub fn navigation_bar_height_px() -> f32 {
