@@ -153,6 +153,8 @@ struct Actions {
     remove_favorite: Option<DeviceId>,
     dismiss_request: Option<DeviceId>,
     dismiss_send: bool,
+    /// A new device name; empty goes back to the platform's name.
+    rename: Option<String>,
     scan: bool,
 }
 
@@ -178,6 +180,8 @@ pub struct AirLynxApp {
     remote: Option<RemoteBrowser>,
     /// The favorite whose details are open in Settings.
     info_open: Option<DeviceId>,
+    /// The device name being typed in Settings, while the editor is open.
+    name_edit: Option<String>,
     last_scan: Instant,
     #[cfg(target_os = "android")]
     last_dir_check: Instant,
@@ -197,11 +201,11 @@ impl AirLynxApp {
             Ok(profile) => (profile, None),
             // Still usable for this session, but favorites will be lost on exit.
             Err(e) => (
-                Profile { id: DeviceId::random(), favorites: Favorites::in_memory() },
+                Profile { id: DeviceId::random(), name: None, favorites: Favorites::in_memory() },
                 Some(format!("Favorites cannot be saved: {e}")),
             ),
         };
-        let device_name = platform::device_name();
+        let device_name = profile.name.clone().unwrap_or_else(platform::device_name);
         let mut app = Self {
             shared: Arc::default(),
             cancel: Arc::default(),
@@ -219,6 +223,7 @@ impl AirLynxApp {
             open_error: None,
             remote: None,
             info_open: None,
+            name_edit: None,
             last_scan: Instant::now(),
             #[cfg(target_os = "android")]
             last_dir_check: Instant::now(),
@@ -444,6 +449,9 @@ impl AirLynxApp {
         if actions.dismiss_send {
             self.shared.lock().unwrap().send = SendStatus::Idle;
         }
+        if let Some(name) = actions.rename {
+            self.rename(ctx, &name);
+        }
         if actions.scan {
             let mut s = self.shared.lock().unwrap();
             if s.scanning {
@@ -453,6 +461,21 @@ impl AirLynxApp {
                 drop(s);
                 self.start_scan(ctx, true);
             }
+        }
+    }
+
+    /// Saves the new name and announces it: the receiver and the scans copy the identity, so the receiver restarts.
+    fn rename(&mut self, ctx: &egui::Context, name: &str) {
+        match Profile::save_name(&platform::config_dir(), name) {
+            Ok(saved) => {
+                self.identity.name = Identity::new(self.identity.id, &saved.unwrap_or_else(platform::device_name)).name;
+                self.name_edit = None;
+                self.notice = None;
+                if self.receiver.is_some() {
+                    self.restart_receiver(ctx);
+                }
+            }
+            Err(e) => self.notice = Some(format!("The name cannot be saved: {e}")),
         }
     }
 
@@ -976,12 +999,39 @@ impl AirLynxApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 theme::tile(ui, device_icon(platform::device_kind()), 44.0, Tint::Accent);
-                ui.vertical(|ui| {
+                let mid_w = (ui.available_width() - 80.0 - 12.0).max(40.0);
+                ui.allocate_ui_with_layout(vec2(mid_w, 44.0), Layout::top_down(Align::Min), |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new(&self.identity.name).family(theme::bold()).size(15.5));
+                    ui.add(egui::Label::new(RichText::new(&self.identity.name).family(theme::bold()).size(15.5)).truncate());
                     theme::sub(ui, &format!("Visible to nearby devices, id {}", self.identity.id.short()));
                 });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.name_edit.is_none() && theme::button(ui, Kind::Text, None, "Rename", true).clicked() {
+                        self.name_edit = Some(self.identity.name.clone());
+                    }
+                });
             });
+            let mut cancel = false;
+            if let Some(text) = &mut self.name_edit {
+                ui.add_space(8.0);
+                ui.add(egui::TextEdit::singleline(text).hint_text("Device name").desired_width(f32::INFINITY));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let ready = !text.trim().is_empty();
+                    if theme::button(ui, Kind::Primary, None, "Save", ready).clicked() {
+                        actions.rename = Some(text.clone());
+                    }
+                    if theme::button(ui, Kind::Text, None, "Use device name", true).clicked() {
+                        actions.rename = Some(String::new());
+                    }
+                    if theme::button(ui, Kind::Text, None, "Cancel", true).clicked() {
+                        cancel = true;
+                    }
+                });
+            }
+            if cancel {
+                self.name_edit = None;
+            }
         });
 
         theme::section(ui, "Receiving", None);

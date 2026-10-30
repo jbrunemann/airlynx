@@ -145,7 +145,7 @@ fn run(cli: Cli) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("no config directory; pass --config-dir"))?;
     let profile = Profile::load(&dir)?;
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-    let me = Identity::new(profile.id, hostname.strip_suffix(".local").unwrap_or(&hostname))
+    let me = Identity::new(profile.id, profile.name.as_deref().unwrap_or_else(|| hostname.strip_suffix(".local").unwrap_or(&hostname)))
         .with_kind(DeviceKind::Desktop);
 
     match cli.command {

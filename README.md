@@ -95,7 +95,10 @@ receiver also has an accept thread and a discovery responder thread, and both po
 The app rescans every 6 s, and a device stays "online" for 20 s after its last answer.
 
 Identity and favorites are stored in `<config dir>/AirLynx` on desktop (`~/Library/Application Support/AirLynx`
-on macOS) and in the app's private `files/config` on Android, as `device-id` and `favorites` text files.
+on macOS) and in the app's private `files/config` on Android, as `device-id`, `favorites` and (optional) `device-name` text files.
+`device-name` holds the name the user chose under Settings > This device > **Rename**; without it the platform's own name is used
+(hostname on desktop, the model on Android). The CLI reads it too, and `receive --name` still overrides it. Saving restarts the receiver so the
+new name is announced, and favorites pick it up on their next scan.
 A `favorites` line is `<id> kind:<desktop|mobile|unknown> <name>`; older lines without `kind:` still load.
 `addresses` holds `<id> <ip>`. `seen` holds what the favorite details show besides the address, one line per favorite:
 `<id> <first> <last> <port|-> <mutual 0|1|-> <local ip|-> <interface|->` (Unix seconds, interface last because its name can

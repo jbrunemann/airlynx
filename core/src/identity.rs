@@ -514,6 +514,8 @@ impl FavoritesInner {
 /// This device's id and favorites, stored in one directory.
 pub struct Profile {
     pub id: DeviceId,
+    /// The name the user chose for this device, if any. Without one the platform's own name is used.
+    pub name: Option<String>,
     pub favorites: Favorites,
 }
 
@@ -530,9 +532,27 @@ impl Profile {
                 id
             }
         };
-        Ok(Self { id, favorites: Favorites::load(dir.join("favorites"))? })
+        let name = fs::read_to_string(dir.join(NAME_FILE)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        Ok(Self { id, name: name.map(|n| clean_name(&n)), favorites: Favorites::load(dir.join("favorites"))? })
+    }
+
+    /// Stores the chosen device name in `dir` and returns it as it will be announced (cleaned up). An empty name
+    /// removes the choice, so the platform's own name applies again and `None` is returned.
+    pub fn save_name(dir: &Path, name: &str) -> io::Result<Option<String>> {
+        let path = dir.join(NAME_FILE);
+        if name.trim().is_empty() {
+            return match fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(None),
+            };
+        }
+        let name = clean_name(name);
+        write_atomic(&path, &format!("{name}\n"))?;
+        Ok(Some(name))
     }
 }
+
+const NAME_FILE: &str = "device-name";
 
 fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
@@ -552,6 +572,19 @@ mod tests {
         assert!("xyz".parse::<DeviceId>().is_err());
         assert!("g".repeat(32).parse::<DeviceId>().is_err());
         assert_ne!(DeviceId::random(), DeviceId::random());
+    }
+
+    #[test]
+    fn chosen_name_is_saved_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("airlynx-name-{}", DeviceId::random()));
+        assert_eq!(Profile::load(&dir).unwrap().name, None);
+        assert_eq!(Profile::save_name(&dir, "  Living room\n Mac ").unwrap().as_deref(), Some("Living room Mac"));
+        assert_eq!(Profile::load(&dir).unwrap().name.as_deref(), Some("Living room Mac"));
+        assert_eq!(Profile::save_name(&dir, "  ").unwrap(), None);
+        assert_eq!(Profile::load(&dir).unwrap().name, None);
+        // Clearing twice is fine.
+        assert_eq!(Profile::save_name(&dir, "").unwrap(), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
