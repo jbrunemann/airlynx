@@ -59,8 +59,8 @@ pub fn prepare(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Vec<Entry
         .collect()
 }
 
-/// Sends `entries` to `addr` as `me`. The receiver must have `me` as a favorite,
-/// otherwise this fails with `ErrorKind::PermissionDenied`. `on_progress` is
+/// Sends `entries` to `addr` as `me`. The receiver must have `me` as a favorite and be able to write to its
+/// save folder, otherwise this fails with `ErrorKind::PermissionDenied` before any file data is sent. `on_progress` is
 /// called after every chunk; returning `ControlFlow::Break` cancels the transfer.
 pub fn send_files(
     addr: SocketAddr,
@@ -89,6 +89,12 @@ pub fn send_files(
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "the receiver has not added this device as a favorite",
+            ));
+        }
+        STATUS_NO_WRITE_ACCESS => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the receiver cannot write to its save folder",
             ));
         }
         _ => return Err(invalid("receiver rejected the handshake")),

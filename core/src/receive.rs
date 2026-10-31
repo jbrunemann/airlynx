@@ -11,13 +11,20 @@ use sha2::{Digest, Sha256};
 
 use crate::discovery;
 use crate::identity::{DeviceId, Favorites, Identity};
+use crate::mdns::{self, Advertisement};
 use crate::protocol::*;
 use crate::secure::Ephemeral;
+use crate::stats;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Emit a progress event roughly every this many bytes.
 const PROGRESS_STEP: u64 = 512 * 1024;
+
+/// How long the accept loop sleeps between checks. The discovery loop waits twice as long for a packet.
+/// Both only bound how quickly the receiver notices it was stopped, apart from the accept loop also
+/// delaying a new connection by up to this long. Longer means fewer wakeups, which saves battery.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ReceiverConfig {
@@ -26,6 +33,7 @@ pub struct ReceiverConfig {
     pub identity: Identity,
     /// Only these devices may send. Shared, so changes apply to the running receiver.
     pub favorites: Favorites,
+    pub poll_interval: Duration,
 }
 
 /// Everything a receiver reports. `peer` is the sender's "ip:port".
@@ -33,6 +41,8 @@ pub struct ReceiverConfig {
 pub enum ReceiveEvent {
     /// A device that is not a favorite tried to send. Nothing was accepted.
     Refused { peer: String, id: DeviceId, name: String },
+    /// A favorite tried to send, but the save folder cannot be written to. Nothing was accepted.
+    NotWritable { peer: String, error: String },
     Connected { peer: String, files: u32 },
     FileStarted { peer: String, name: String, size: u64 },
     FileProgress { peer: String, name: String, received: u64, size: u64 },
@@ -47,6 +57,8 @@ pub struct ReceiverHandle {
     port: u16,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Keeps the mDNS registration alive (none if mDNS is unavailable).
+    _advertisement: Option<Advertisement>,
 }
 
 impl ReceiverHandle {
@@ -81,7 +93,7 @@ pub fn start(
     let listener = TcpListener::bind(("0.0.0.0", config.port))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
-    let udp = discovery::bind_responder()?;
+    let udp = discovery::bind_responder(config.poll_interval * 2)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let responder = discovery::spawn_responder(
@@ -92,14 +104,19 @@ pub fn start(
         stop.clone(),
     );
 
+    let advertisement = mdns::advertise(&config.identity, port);
+
     let on_event: Arc<dyn Fn(ReceiveEvent) + Send + Sync> = Arc::new(on_event);
     let accept_stop = stop.clone();
     let dir = config.dir;
     let favorites = config.favorites;
+    let poll_interval = config.poll_interval;
     let acceptor = thread::spawn(move || {
         while !accept_stop.load(Ordering::Relaxed) {
+            stats::accept_poll();
             match listener.accept() {
                 Ok((stream, addr)) => {
+                    stats::session();
                     let dir = dir.clone();
                     let on_event = on_event.clone();
                     let favorites = favorites.clone();
@@ -113,9 +130,9 @@ pub fn start(
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(poll_interval);
                 }
-                Err(_) => thread::sleep(Duration::from_millis(100)),
+                Err(_) => thread::sleep(poll_interval),
             }
         }
     });
@@ -124,6 +141,7 @@ pub fn start(
         port,
         stop,
         threads: vec![responder, acceptor],
+        _advertisement: advertisement,
     })
 }
 
@@ -137,6 +155,7 @@ fn handle_session(
     // Accepted sockets can inherit the listener's non-blocking mode.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
 
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic)?;
@@ -159,8 +178,19 @@ fn handle_session(
         on_event(ReceiveEvent::Refused { peer: peer.into(), id: sender.id, name: sender.name });
         return Ok(());
     }
+    // Say so before the sender streams any data, rather than failing halfway through the first file.
+    // Only favorites get here, so a stranger learns nothing about this device's storage.
+    if let Err(e) = check_writable(dir) {
+        stream.write_all(&[STATUS_NO_WRITE_ACCESS])?;
+        stream.flush()?;
+        on_event(ReceiveEvent::NotWritable { peer: peer.into(), error: e.to_string() });
+        return Ok(());
+    }
     stream.write_all(&[STATUS_OK])?;
     stream.flush()?;
+    if let Some(ip) = peer_ip {
+        favorites.remember_address(sender.id, ip);
+    }
 
     let count = read_u32(&mut stream)?;
     on_event(ReceiveEvent::Connected { peer: peer.into(), files: count });
@@ -211,6 +241,19 @@ fn handle_session(
         }
     }
     Ok(())
+}
+
+/// Makes sure `dir` exists and a file can be created in it. Permissions can change while the receiver
+/// runs (all-files access revoked, a read-only volume, a deleted folder), so this is asked per session.
+fn check_writable(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(
+        ".airlynx-write-test.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    File::create(&probe)?;
+    fs::remove_file(&probe)
 }
 
 /// Streams `size` bytes into `path`, then reads the sender's hash.
@@ -299,6 +342,15 @@ mod tests {
     /// Runs one receiver session on loopback and returns the sender's result
     /// and the receiver's events.
     fn loopback(favorites: &Favorites, sender: &Identity) -> (io::Result<send::Report>, Vec<ReceiveEvent>) {
+        loopback_to(favorites, sender, |base| base.join("in"))
+    }
+
+    /// Like `loopback`, with the receiver saving to the folder `save_dir` picks inside the scratch folder.
+    fn loopback_to(
+        favorites: &Favorites,
+        sender: &Identity,
+        save_dir: impl FnOnce(&Path) -> PathBuf,
+    ) -> (io::Result<send::Report>, Vec<ReceiveEvent>) {
         let dir = std::env::temp_dir().join(format!("airlynx-recv-{}", DeviceId::random()));
         fs::create_dir_all(&dir).unwrap();
         let src = dir.join("hello.txt");
@@ -309,8 +361,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let server = {
-            let (favorites, events, dir) = (favorites.clone(), events.clone(), dir.join("in"));
-            fs::create_dir_all(&dir).unwrap();
+            let (favorites, events, dir) = (favorites.clone(), events.clone(), save_dir(&dir));
+            let _ = fs::create_dir_all(&dir);
             thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
                 let sink = |e| events.lock().unwrap().push(e);
@@ -332,6 +384,23 @@ mod tests {
         let (result, events) = loopback(&favorites, &me);
         assert_eq!(result.unwrap().sent, ["hello.txt"]);
         assert!(events.iter().any(|e| matches!(e, ReceiveEvent::FileSaved { .. })));
+    }
+
+    #[test]
+    fn unwritable_folder_is_refused_before_any_data() {
+        let me = Identity::new(DeviceId::random(), "Phone");
+        let favorites = Favorites::in_memory();
+        favorites.add(me.id, "Phone", DeviceKind::Unknown).unwrap();
+        // A folder below a regular file can be neither found nor created, whoever runs the test.
+        let (result, events) = loopback_to(&favorites, &me, |base| {
+            let blocker = base.join("blocker");
+            fs::write(&blocker, b"not a folder").unwrap();
+            blocker.join("in")
+        });
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("cannot write"), "{err}");
+        assert!(matches!(&events[..], [ReceiveEvent::NotWritable { .. }]), "{events:?}");
     }
 
     #[test]
