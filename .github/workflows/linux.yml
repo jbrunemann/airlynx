@@ -1,0 +1,45 @@
+name: Linux
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: ""
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    # Both are built on x86 (cross-compiled for arm64) so it runs on every plan: native arm runners are not free for
+    # private repos. 22.04 on purpose: the binaries need at most glibc 2.35, so they also run on Raspberry Pi OS and Debian 12.
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the arm64 cross linker
+        if: matrix.target != ''
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal ${{ matrix.target && format('--target {0}', matrix.target) || '' }} && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      # The tarball holds the desktop app, the CLI, the icons, a desktop entry and install.sh (see scripts/bundle-linux.sh).
+      - name: Bundle
+        run: scripts/bundle-linux.sh ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlynx-linux-${{ matrix.arch }}
+          path: target/linux/airlynx-linux-${{ matrix.arch }}.tar.gz

@@ -150,6 +150,12 @@ def main():
           '    <monochrome android:drawable="@drawable/ic_launcher_monochrome"/>\n'
           '</adaptive-icon>\n')
 
+    # Linux: the freedesktop icon theme layout, which the desktop's menu and dock look in (they ignore a lone 512 px png).
+    hicolor = os.path.join(ROOT, "assets", "hicolor")
+    for px in (16, 32, 48, 64, 128, 256, 512):
+        render(full_icon(), px, os.path.join(hicolor, f"{px}x{px}", "apps", "airlynx.png"))
+    write(os.path.join(hicolor, "scalable", "apps", "airlynx.svg"), full_icon())
+
     # macOS .icns
     with tempfile.TemporaryDirectory() as tmp:
         iconset = os.path.join(tmp, "AirLynx.iconset")

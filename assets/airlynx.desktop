@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AirLynx
+GenericName=File Transfer
+Comment=Send files to your own devices on the local network
+Exec=airlynx-app
+Icon=airlynx
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=send;receive;share;transfer;files;lan;android;
+StartupWMClass=airlynx

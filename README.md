@@ -27,9 +27,22 @@ cargo run --release -p airlynx-app          # or run without bundling
 ./scripts/build-apk.sh                      # -> target/release/apk/AirLynx.apk and AirLynx-armv7.apk
 ./scripts/build-apk.sh --install            # build + adb install (the arm64 one)
 
-# Linux arm64 (CLI and desktop app): built by GitHub, see .github/workflows/linux-arm64.yml. Download the
-# airlynx-linux-arm64 artifact from the Actions run. Cross-compiled on x86 with gcc-aarch64-linux-gnu, so it needs
-# glibc 2.35 or newer and, for the app, libxkbcommon and libGL (or Wayland/X11 libs) on the target. Not run on a real arm board yet.
+# Linux (desktop app, CLI, icon and menu entry for Xfce/GNOME/KDE): one tarball per CPU, built by GitHub (.github/workflows/linux.yml,
+# artifacts airlynx-linux-x86_64 and airlynx-linux-aarch64) or from a Mac with Docker running:
+./scripts/build-linux-docker.sh             # -> target/linux-docker/airlynx-linux-aarch64.tar.gz (native here; pass linux/amd64 for x86_64, emulated)
+./scripts/bundle-linux.sh                   # on Linux itself: -> target/linux/airlynx-linux-<arch>.tar.gz
+# On the target: tar xzf airlynx-linux-<arch>.tar.gz && cd airlynx-linux-<arch> && ./install.sh
+# It installs into ~/.local (programs, hicolor icons, airlynx.desktop), so AirLynx shows up in the menu under Internet with its icon;
+# "./install.sh --uninstall" removes it. Binaries are built on Ubuntu 22.04, so they need glibc 2.35 or newer, and the app needs
+# libxkbcommon and OpenGL (sudo apt install libxkbcommon0 libgl1). Only the aarch64 bundle has been built and run (headless, see Toolchain).
+
+# Termux (the CLI as a plain Android executable, no APK): cross-compiled with the NDK, API 24+
+./scripts/build-termux.sh                   # -> target/release/termux/airlynx-termux-aarch64.tar.gz and ...-armv7.tar.gz
+./scripts/build-termux.sh --push            # also adb push the aarch64 tarball to /sdcard/Download
+# In Termux (run termux-setup-storage once), unpack and run the bundled installer (scripts/termux-install.sh):
+#   tar xzf /sdcard/Download/airlynx-termux-aarch64.tar.gz -C ~ && ~/airlynx-termux-aarch64/install.sh
+# It puts airlynx in $PREFIX/bin and prepares ~/storage/downloads/AirLynx; "install.sh --uninstall" removes it.
+# Or build it inside Termux: pkg install rust && cargo install --path cli (slow, but needs no NDK)
 
 # CLI (same profile as the desktop app unless --config-dir is given)
 cargo run --release -p airlynx -- receive --dir ./received
@@ -88,6 +101,10 @@ Cargo workspace (edition 2024, resolver 3):
 | `assets/icon/` | | Icon master (`airlynx.svg`), 512 px PNG (desktop window icon), `AirLynx.icns` (macOS bundle), `airlynx-logo.png` (192 px, cropped to the icon edge, shown in the app header) |
 | `scripts/make-icons.py` | | Draws the icon and renders every size (needs `rsvg-convert`, `iconutil`); outputs are committed |
 | `scripts/build-apk.sh` | | Sets SDK/NDK env, creates the debug keystore if missing, runs `cargo apk build --release --lib`, then adds the Java service (see gotchas) |
+| `scripts/build-termux.sh` | | Cross-compiles the `airlynx` CLI for `aarch64-linux-android` and `armv7-linux-androideabi` with the NDK clang at API 24 (Termux's minimum), one tarball per CPU with `install.sh` and `README.txt` |
+| `scripts/termux-install.sh` | | Becomes `install.sh` in the Termux tarball (POSIX sh): checks the binary runs, installs into `$PREFIX/bin`, prepares the save folder, prints next steps, `--uninstall` |
+| `scripts/bundle-linux.sh` | | Builds the Linux tarball: desktop app, CLI, `assets/airlynx.desktop`, `assets/hicolor` icons, `install.sh` (from `scripts/linux-install.sh`) and `README.txt`; takes an optional Rust target for cross builds |
+| `scripts/build-linux-docker.sh` | | Runs `bundle-linux.sh` in an Ubuntu 22.04 container, for building from a Mac |
 | `scripts/bundle-macos.sh` | | Builds `AirLynx.app` with Info.plist (incl. `NSLocalNetworkUsageDescription`), ad-hoc signs it |
 
 ### Threading model (app)
@@ -278,6 +295,14 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
 - Rust 1.95+, targets `aarch64-linux-android` and `armv7-linux-androideabi`
 - Android SDK at `~/Library/Android/sdk` (platform 34, build-tools 36, NDK 27.3), `cargo-apk` 0.10
 - The scripts default `ANDROID_HOME` to the path above and pick the newest NDK unless `ANDROID_NDK_ROOT` is set
+- The Termux build is the CLI only (the app needs the APK's NativeActivity). It was run on the arm64 emulator in `adb shell`, which has
+  the same bionic userland as Termux: mutual favorites, broadcast discovery over the real interfaces, and an encrypted send all worked,
+  and so did `install.sh` (install, uninstall, wrong-CPU bundle, no shared storage) with `PREFIX` and `HOME` pointed at scratch folders.
+  Not run inside Termux itself or on 32-bit Android (the armv7 binary is only built). In Termux the hostname is `localhost`, so pass `--name`.
+- The Linux bundle (aarch64) was built in Docker and its `install.sh` run in a clean Ubuntu 22.04 container: files land in `~/.local`,
+  `desktop-file-validate` passes, `--uninstall` removes everything, and the app started under Xvfb with window class `airlynx` (the
+  `with_app_id` in `app/src/main.rs`, which matches `StartupWMClass`). It was not looked at on a real Xfce desktop, so the panel icon
+  is unconfirmed. The x86_64 bundle was not built.
 - Key versions: `eframe`/`egui` 0.37 (glow backend), `winit` 0.30.13, `jni` 0.21, `rfd` 0.17
 - Android package id `dev.airlynx.app`, minSdk 30, targetSdk 34
 
@@ -462,6 +487,9 @@ Rough priority order:
    and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
 8. **Browsing follow-ups:** an owner-side switch to turn sharing of the save folder off (now every favorite that has added you can read it),
    cancelling a download, downloading a whole folder, and showing downloads in History. Not run on a device or looked at on a real screen yet.
+9. **Finder Network entry (SMB gateway):** each online favorite as a read-only SMB share under Network in Finder. Spiked, not built:
+   Finder mounted a reference SMB2 server through a Bonjour `_smb._tcp` entry on a custom port with Guest login. See `SMB-GATEWAY.md` for
+   what was tested, which Bonjour types Finder lists, the design and the open questions.
 
 ### Icebox
 
