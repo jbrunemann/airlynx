@@ -86,6 +86,8 @@ pub enum DeviceKind {
     Mobile,
     /// A computer running Macsplorer, which speaks AirLynx too. Older builds read its code as `Unknown`.
     Macsplorer,
+    /// An Android TV. Older builds read its code as `Unknown`.
+    Tv,
 }
 
 impl DeviceKind {
@@ -96,6 +98,7 @@ impl DeviceKind {
             DeviceKind::Desktop => 'd',
             DeviceKind::Mobile => 'm',
             DeviceKind::Macsplorer => 'x',
+            DeviceKind::Tv => 't',
         }
     }
 
@@ -104,6 +107,7 @@ impl DeviceKind {
             "d" => DeviceKind::Desktop,
             "m" => DeviceKind::Mobile,
             "x" => DeviceKind::Macsplorer,
+            "t" => DeviceKind::Tv,
             _ => DeviceKind::Unknown,
         }
     }
@@ -114,11 +118,12 @@ impl DeviceKind {
             DeviceKind::Desktop => "desktop",
             DeviceKind::Mobile => "mobile",
             DeviceKind::Macsplorer => "macsplorer",
+            DeviceKind::Tv => "tv",
         }
     }
 
     fn from_word(word: &str) -> Option<Self> {
-        [DeviceKind::Unknown, DeviceKind::Desktop, DeviceKind::Mobile, DeviceKind::Macsplorer].into_iter().find(|k| k.word() == word)
+        [DeviceKind::Unknown, DeviceKind::Desktop, DeviceKind::Mobile, DeviceKind::Macsplorer, DeviceKind::Tv].into_iter().find(|k| k.word() == word)
     }
 }
 

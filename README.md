@@ -123,7 +123,7 @@ on macOS) and in the app's private `files/config` on Android, as `device-id`, `f
 `device-name` holds the name the user chose under Settings > This device > **Rename**; without it the platform's own name is used
 (hostname on desktop, the model on Android). The CLI reads it too, and `receive --name` still overrides it. Saving restarts the receiver so the
 new name is announced, and favorites pick it up on their next scan.
-A `favorites` line is `<id> kind:<desktop|mobile|unknown> <name>`; older lines without `kind:` still load.
+A `favorites` line is `<id> kind:<desktop|mobile|macsplorer|tv|unknown> <name>`; older lines without `kind:` still load.
 `addresses` holds `<id> <ip>`. `seen` holds what the favorite details show besides the address, one line per favorite:
 `<id> <first> <last> <port|-> <mutual 0|1|-> <local ip|-> <interface|->` (Unix seconds, interface last because its name can
 hold spaces). A scan or an incoming session from a favorite updates it; a change of only the last-seen time is written at most once a minute,
@@ -153,9 +153,9 @@ no single one works on every network:
 
 The question and the answer keep their format (the answer only gained one more `kind` letter, which older builds ignore, and the TCP protocol did not change, so `VERSION` stays 4).
 Every other running device replies
-`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <kind d|m|x|?> <name>` to the asker's address. `kind` is `d` for a
-computer, `m` for a mobile device, `x` for a computer running Macsplorer (shown with a monitor-and-folder icon), `?` if unknown (shown as an icon next to favorites).
-Builds from before `x` existed read it as `?`, so nothing breaks. `mutual` is 1 when the replier has
+`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <kind d|m|x|t|?> <name>` to the asker's address. `kind` is `d` for a
+computer, `m` for a mobile device, `x` for a computer running Macsplorer (shown with a monitor-and-folder icon), `t` for an Android TV (a TV icon), `?` if unknown (shown as an icon next to favorites).
+Builds from before `x` or `t` existed read them as `?`, so nothing breaks. `mutual` is 1 when the replier has
 the asker as a favorite. The asker drops replies carrying its own id and de-duplicates by id, so a device that answers on several interfaces or
 through several of the ways above is listed once.
 
@@ -278,10 +278,12 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
   and button labels use the `theme::bold()` family. The mockups the design came from were made on a Claude Design canvas
   and are not in the repo.
 - **Android TV:** the same APK runs on a TV (`LEANBACK_LAUNCHER` filter and a banner in the manifest, touchscreen, leanback and portrait
-  declared optional). `android::is_tv()` (UI mode TELEVISION) zooms the UI to 1.4 and `MainActivity` switches it to landscape. The remote's
+  declared optional). `android::is_tv()` (UI mode TELEVISION) reports itself as kind `t` (TV icon) and fits the zoom on the first frame so the layout is 540 points tall (`AirLynxApp::fit_tv_zoom`; 1.0 on the 1080p, 320 dpi test TV), and `MainActivity` switches it to landscape. The remote's
   D-pad arrives as arrow keys and Enter, which egui turns into focus moves and clicks. egui only moves focus from a widget that already
   has it, so `AirLynxApp::handle_keys` focuses the first widget on the first arrow press. The custom-painted widgets call `theme::focus_ring`,
-  which draws a ring only after key input (not after a tap) and scrolls the widget into view. Back closes the file browser or the remote
+  which draws a ring only after key input (not after a tap) and scrolls the widget into view. Only buttons and checkboxes take focus, so
+  `handle_keys` also scrolls the page by `TV_SCROLL_STEP` when an Up or Down press leaves focus where it was (otherwise the text below the last
+  button on Settings could never be reached; verified on the TV with `adb shell input keyevent KEYCODE_DPAD_DOWN`). Back closes the file browser or the remote
   folder view, then returns to Send, then sends the app to the background (`moveTaskToBack`, the receiver keeps running). Not tried on a
   real TV yet, only the D-pad and Back keys on the phone emulator (`adb shell input keyevent KEYCODE_DPAD_DOWN`, `KEYCODE_BACK`).
   There are two APKs, arm64 and armv7, because many TVs (the Philips PUS8545 is believed to be one) have a 32-bit userland;

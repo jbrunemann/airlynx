@@ -161,6 +161,9 @@ struct Actions {
     scan: bool,
 }
 
+/// How far one Up or Down press scrolls a page that has nothing left to focus, in points.
+const TV_SCROLL_STEP: f32 = 140.0;
+
 pub struct AirLynxApp {
     shared: Arc<Mutex<Shared>>,
     cancel: Arc<AtomicBool>,
@@ -185,6 +188,13 @@ pub struct AirLynxApp {
     info_open: Option<DeviceId>,
     /// The device name being typed in Settings, while the editor is open.
     name_edit: Option<String>,
+    /// The television's zoom has been fitted to its screen (done on the first frame, when the size is known).
+    tv_fitted: bool,
+    /// An Up or Down press on the remote from the last frame: which way, and what had focus. If focus is still
+    /// there this frame, no widget took the press and the page scrolls instead (see `handle_keys`).
+    arrow_probe: Option<(f32, Option<egui::Id>)>,
+    /// Points the page still has to scroll down (negative: up), set by `handle_keys`, spent in the scroll area.
+    scroll_by: f32,
     last_scan: Instant,
     #[cfg(target_os = "android")]
     last_dir_check: Instant,
@@ -197,10 +207,6 @@ pub struct AirLynxApp {
 impl AirLynxApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
-        if platform::is_tv() {
-            // Read from the couch: everything a little bigger.
-            cc.egui_ctx.set_zoom_factor(1.4);
-        }
         #[cfg(target_os = "android")]
         sync_theme(&cc.egui_ctx);
 
@@ -231,6 +237,9 @@ impl AirLynxApp {
             remote: None,
             info_open: None,
             name_edit: None,
+            tv_fitted: false,
+            arrow_probe: None,
+            scroll_by: 0.0,
             last_scan: Instant::now(),
             #[cfg(target_os = "android")]
             last_dir_check: Instant::now(),
@@ -390,8 +399,21 @@ impl AirLynxApp {
             let arrow = [egui::Key::ArrowUp, egui::Key::ArrowDown, egui::Key::ArrowLeft, egui::Key::ArrowRight].into_iter().any(|k| i.key_pressed(k));
             (arrow, i.key_pressed(egui::Key::BrowserBack))
         });
-        if arrow && ctx.memory(|m| m.focused()).is_none() {
+        let focused = ctx.memory(|m| m.focused());
+        if arrow && focused.is_none() {
             ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::Next));
+        }
+        // Only buttons take focus, so on a page with text below the last button (Settings) Down would never get there.
+        // egui moves focus at the end of the frame, so a press that left focus where it was found no widget to go to:
+        // scroll the page instead.
+        if let Some((dir, before)) = self.arrow_probe.take()
+            && focused == before
+        {
+            self.scroll_by = dir * TV_SCROLL_STEP;
+        }
+        let (down, up) = ctx.input(|i| (i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::ArrowUp)));
+        if platform::is_tv() && focused.is_some() && (down || up) {
+            self.arrow_probe = Some((if down { 1.0 } else { -1.0 }, focused));
         }
         if !back {
             return;
@@ -408,6 +430,23 @@ impl AirLynxApp {
         } else {
             self.tab = Tab::Send;
         }
+    }
+
+    /// A television is read from a couch, but the density Android reports differs between sets (a 1080p screen
+    /// at 320 dpi is 2 pixels per point, at 213 dpi 1.33), so scale to the screen instead of a fixed factor:
+    /// the layout is `TV_POINTS_HIGH` points tall, which is 1.0 on a 1080p screen at 320 dpi.
+    fn fit_tv_zoom(&mut self, ctx: &egui::Context) {
+        const TV_POINTS_HIGH: f32 = 540.0;
+        if self.tv_fitted || !platform::is_tv() {
+            return;
+        }
+        let height = ctx.content_rect().height();
+        if height < 1.0 {
+            return;
+        }
+        self.tv_fitted = true;
+        let zoom = (height * ctx.zoom_factor() / TV_POINTS_HIGH).clamp(0.75, 2.0);
+        ctx.set_zoom_factor(zoom);
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
@@ -1305,6 +1344,7 @@ fn device_icon(kind: DeviceKind) -> Icon {
     match kind {
         DeviceKind::Desktop => Icon::Computer,
         DeviceKind::Mobile => Icon::Phone,
+        DeviceKind::Tv => Icon::Tv,
         DeviceKind::Macsplorer => Icon::Macsplorer,
         DeviceKind::Unknown => Icon::Unknown,
     }
@@ -1432,6 +1472,7 @@ impl eframe::App for AirLynxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.tick(&ctx);
+        self.fit_tv_zoom(&ctx);
         self.handle_keys(&ctx);
 
         #[cfg(not(target_os = "android"))]
@@ -1501,6 +1542,9 @@ impl eframe::App for AirLynxApp {
                 }
                 let mut actions = Actions::default();
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    if self.scroll_by != 0.0 {
+                        ui.scroll_with_delta(vec2(0.0, -std::mem::take(&mut self.scroll_by)));
+                    }
                     ui.spacing_mut().item_spacing.y = 8.0;
                     match self.tab {
                         Tab::Send => self.send_page(ui, &ctx, &shared, wide, &mut actions),

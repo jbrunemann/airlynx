@@ -89,7 +89,7 @@ fn java_string(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> jni::errors::Result<St
 }
 
 pub fn device_kind() -> DeviceKind {
-    DeviceKind::Mobile
+    if is_tv() { DeviceKind::Tv } else { DeviceKind::Mobile }
 }
 
 pub fn device_name() -> String {
