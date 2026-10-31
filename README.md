@@ -90,6 +90,7 @@ Cargo workspace (edition 2024, resolver 3):
 | `app/src/android.rs` | | JNI glue: device model, files shared from other apps, config dir, all-files-access check/request, multicast lock, status bar and navigation bar height, dark mode |
 | `app/src/browser.rs` | | In-app file browser (Android only) |
 | `app/src/remote.rs` | | The remote folder view opened by the folder button on a device card: folders, sizes, a **Get** button per file |
+| `third_party/eframe/` | | eframe 0.37.0 with one marked change in `src/native/glow_integration.rs`, wired in by `[patch.crates-io]` in the root `Cargo.toml` (see the gotcha about quitting at startup on a TV). Drop it when upstream fixes this |
 | `app/src/diag.rs` | | Battery and wakeup diagnostics (Android only): the Settings > Diagnostics card and the optional once-a-minute logcat line |
 | `app/src/lib.rs` | | Module wiring and `android_main` entry point |
 | `app/src/main.rs` | | Desktop entry point |
@@ -284,7 +285,8 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
   folder view, then returns to Send, then sends the app to the background (`moveTaskToBack`, the receiver keeps running). Not tried on a
   real TV yet, only the D-pad and Back keys on the phone emulator (`adb shell input keyevent KEYCODE_DPAD_DOWN`, `KEYCODE_BACK`).
   There are two APKs, arm64 and armv7, because many TVs (the Philips PUS8545 is believed to be one) have a 32-bit userland;
-  the armv7 one has only been compiled and linted, never run. Most TVs have no
+  the armv7 one runs on a real Philips TV (TPM191E, Android 12, 32-bit cortex-a9, MediaTek): UI up, "Ready to receive", adb over the network
+  (`adb connect <tv-ip>:5555`). Sending, receiving and the D-pad have not been tried on it yet. Most TVs have no
   screen for All files access, so grant it with `adb shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow`.
 - **Dark mode on Android** is read over JNI (see the gotchas). On desktop egui follows the system setting.
 
@@ -400,6 +402,12 @@ emulator the battery numbers are fake (it reports 100% and 900 mA) but the CPU a
 
 ## Gotchas learned the hard way
 
+- **The app quit at once on Android TV (and left no log):** `eframe::run_native` returned `Ok` about 50 ms after starting, so
+  `android_main` returned and NativeActivity finished the activity (`wm_finish_activity ... app-request`, process "exited cleanly (0)").
+  eframe's `WinitApp::window_event` answers `EventResult::Exit` when it gets a window event before the first `resumed` has created the
+  window, and on the TV winit delivers one first (focus or a configuration change; phones deliver `InitWindow` first). The patched copy in
+  `third_party/eframe` ignores such an event instead. To debug something like it: nothing is logged below `Error` unless `with_max_level` in
+  `app/src/lib.rs` is raised, and an `Ok` return from `run_native` is silent, so log around it.
 - **egui 0.37 API changed:** `eframe::App` now has `fn ui(&mut self, ui: &mut egui::Ui, frame)`, not `update`.
   Panels are `egui::Panel::top("id").show(ui, …)` and `egui::CentralPanel::default_margins().show(ui, …)`.
   `DroppedFile` is a trait, so use `f.path()`.

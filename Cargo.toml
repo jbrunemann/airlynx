@@ -8,3 +8,8 @@ edition = "2024"
 
 [profile.release]
 strip = true
+
+# eframe 0.37.0 with one change (third_party/eframe/src/native/glow_integration.rs, marked "AirLynx patch"): a window
+# event that arrives before the window exists no longer ends the event loop. Without it the app quits at startup on a TV.
+[patch.crates-io]
+eframe = { path = "third_party/eframe" }
