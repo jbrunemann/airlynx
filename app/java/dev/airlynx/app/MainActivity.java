@@ -4,11 +4,16 @@ import android.app.NativeActivity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.database.Cursor;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.app.UiModeManager;
 import android.provider.OpenableColumns;
+import android.view.WindowInsetsController;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -40,6 +45,10 @@ public class MainActivity extends NativeActivity {
         // Copies from an earlier run are orphans: the native side keeps its file list in memory only.
         deleteTree(new File(getCacheDir(), SHARE_DIR));
         super.onCreate(savedInstanceState);
+        // The manifest pins the phone layout to portrait. A television is always landscape.
+        if (isTelevision()) {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        }
         // After a recreate the same intent is still there, and its files must not be added twice.
         if (savedInstanceState == null) {
             handleShare(getIntent());
@@ -54,6 +63,26 @@ public class MainActivity extends NativeActivity {
     }
 
     // ---- called from native code ------------------------------------------------------------
+
+    /**
+     * Makes the status and navigation bar icons readable on the app's background. The app draws its own
+     * light or dark palette under the bars, but Android picks the icon color from its own theme.
+     * lightBackground is true when the app is in light mode, which needs dark icons.
+     */
+    public void setSystemBarIcons(final boolean lightBackground) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WindowInsetsController controller = getWindow().getInsetsController();
+                if (controller == null) {
+                    return;
+                }
+                int mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(lightBackground ? mask : 0, mask);
+            }
+        });
+    }
 
     /** Paths of the files copied since the last call. */
     public synchronized String[] takeSharedFiles() {
@@ -88,6 +117,17 @@ public class MainActivity extends NativeActivity {
             }
         } catch (IOException ignored) {
         }
+    }
+
+    /** Whether this is an Android TV: no touch screen, driven with a remote. */
+    public boolean isTelevision() {
+        UiModeManager modes = (UiModeManager) getSystemService(UI_MODE_SERVICE);
+        return modes != null && modes.getCurrentModeType() == Configuration.UI_MODE_TYPE_TELEVISION;
+    }
+
+    /** Tells Android's media index about a saved file, so Downloads, Recent and the gallery show it. */
+    public void scanFile(String path) {
+        MediaScannerConnection.scanFile(this, new String[] {path}, null, null);
     }
 
     /** Opens a received file in whichever app handles its type. Returns null, or why it could not be opened. */

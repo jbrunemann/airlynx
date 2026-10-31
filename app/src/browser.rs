@@ -145,5 +145,6 @@ fn folder_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
     ui.painter().rect_stroke(rect, egui::CornerRadius::same(12), egui::Stroke::new(1.0, p.line), egui::StrokeKind::Inside);
     Icon::Folder.paint(ui.painter(), egui::Rect::from_center_size(rect.left_center() + egui::vec2(24.0, 0.0), egui::Vec2::splat(22.0)), p.accent_text, 1.8);
     theme::text_at(ui, rect.left_center() + egui::vec2(48.0, 0.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(15.0), p.text);
+    theme::focus_ring(ui, &response, 12);
     response
 }

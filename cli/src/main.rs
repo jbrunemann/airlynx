@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use airlynx_core::receive::{self, ReceiveEvent, ReceiverConfig};
-use airlynx_core::{DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, DeviceKind, Identity, Peer, Profile, human_size, scan, send};
-use clap::{Parser, Subcommand};
+use airlynx_core::{browse, DEFAULT_TCP_PORT, DISCOVERY_PORT, DeviceId, DeviceKind, Identity, Peer, Profile, human_size, scan, send};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "airlynx", version, about = "Send files to another device on the local network")]
@@ -33,6 +33,10 @@ enum Command {
         /// Name shown to senders (defaults to the hostname)
         #[arg(short, long)]
         name: Option<String>,
+        /// Keep a connection open to every favorite, so that it can start sessions with this device even when it
+        /// cannot reach it directly (for a device behind NAT or a VPN)
+        #[arg(long)]
+        reverse: bool,
     },
     /// Send one or more files to a favorite, or to an address
     Send {
@@ -48,6 +52,24 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         wait: u64,
     },
+    /// List a folder in a favorite's save folder (the folder itself without a path)
+    Browse {
+        /// Path inside the save folder, with "/" between names
+        #[arg(default_value = "")]
+        path: String,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Download a file from a favorite's save folder
+    Get {
+        /// Path inside the save folder, with "/" between names
+        path: String,
+        /// Directory to save the file into
+        #[arg(short, long, default_value = ".")]
+        out: PathBuf,
+        #[command(flatten)]
+        target: Target,
+    },
     /// List other AirLynx devices on the network
     Discover {
         /// Seconds to wait for replies
@@ -57,6 +79,29 @@ enum Command {
     /// Manage favorite devices
     #[command(subcommand)]
     Favorite(FavoriteCommand),
+}
+
+/// Which device a command talks to.
+#[derive(Args)]
+struct Target {
+    /// Favorite name or id (prefix)
+    #[arg(short, long)]
+    device: Option<String>,
+    /// Device as IP, host, or host:port (skips discovery)
+    #[arg(short, long, conflicts_with = "device")]
+    to: Option<String>,
+    /// Seconds to wait for discovery replies
+    #[arg(long, default_value_t = 2)]
+    wait: u64,
+}
+
+impl Target {
+    fn resolve(self, profile: &Profile, me: &Identity) -> io::Result<SocketAddr> {
+        match self.to {
+            Some(target) => send::resolve(&target),
+            None => pick_receiver(profile, me, self.device.as_deref(), Duration::from_secs(self.wait)),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -100,21 +145,39 @@ fn run(cli: Cli) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("no config directory; pass --config-dir"))?;
     let profile = Profile::load(&dir)?;
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-    let me = Identity::new(profile.id, hostname.strip_suffix(".local").unwrap_or(&hostname))
+    let me = Identity::new(profile.id, profile.name.as_deref().unwrap_or_else(|| hostname.strip_suffix(".local").unwrap_or(&hostname)))
         .with_kind(DeviceKind::Desktop);
 
     match cli.command {
-        Command::Receive { dir, port, name } => {
+        Command::Receive { dir, port, name, reverse } => {
             let me = name.map_or(me.clone(), |n| Identity::new(me.id, &n).with_kind(me.kind));
             run_receive(ReceiverConfig {
                 dir,
                 port,
                 identity: me,
                 favorites: profile.favorites,
-                poll_interval: receive::DEFAULT_POLL_INTERVAL,
+                reverse,
             })
         }
         Command::Send { files, device, to, wait } => run_send(&profile, &me, files, device, to, Duration::from_secs(wait)),
+        Command::Browse { path, target } => {
+            let addr = target.resolve(&profile, &me)?;
+            let entries = browse::list(addr, &me, &path)?;
+            if entries.is_empty() {
+                println!("(empty)");
+            }
+            for e in entries {
+                let size = if e.is_dir { String::new() } else { human_size(e.size) };
+                println!("{:<10}{}{}", size, e.name, if e.is_dir { "/" } else { "" });
+            }
+            Ok(())
+        }
+        Command::Get { path, out, target } => {
+            let addr = target.resolve(&profile, &me)?;
+            let saved = browse::download(addr, &me, &path, &out, |_, _| {})?;
+            println!("Saved {}", saved.display());
+            Ok(())
+        }
         Command::Discover { wait } => {
             let peers = scan(&me, &profile.favorites, Duration::from_secs(wait))?;
             if peers.is_empty() {
@@ -216,6 +279,8 @@ fn run_receive(config: ReceiverConfig) -> io::Result<()> {
             println!("[{peer}] saved {} ({})", path.display(), human_size(size))
         }
         ReceiveEvent::FileRejected { peer, name, reason } => eprintln!("[{peer}] {name}: {reason}"),
+        ReceiveEvent::Listed { peer, path } => println!("[{peer}] listed /{path}"),
+        ReceiveEvent::Served { peer, path, size } => println!("[{peer}] served /{path} ({})", human_size(size)),
         ReceiveEvent::SessionEnded { peer, error: None } => println!("[{peer}] done"),
         ReceiveEvent::SessionEnded { peer, error: Some(e) } => eprintln!("[{peer}] error: {e}"),
         ReceiveEvent::FileStarted { .. } | ReceiveEvent::FileProgress { .. } => {}

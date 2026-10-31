@@ -12,10 +12,14 @@ use airlynx_core::{DEFAULT_TCP_PORT, DeviceId, DeviceKind, Favorites, Identity, 
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, vec2};
 
 use crate::platform;
+use crate::remote::{self, RemoteBrowser};
 use crate::theme::{self, Icon, Kind, Tint, pal};
 
-/// How often the network is scanned in the background.
+/// How often the network is scanned in the background while the window has focus and shows which devices
+/// are online (the Send and Settings pages).
 const SCAN_INTERVAL: Duration = Duration::from_secs(6);
+/// How often otherwise. Each scan wakes every device that answers, so this is long.
+const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(60);
 /// A device counts as online until it has been silent this long, so one lost
 /// UDP packet does not make a favorite flicker offline.
 const PEER_TTL: Duration = Duration::from_secs(20);
@@ -147,12 +151,18 @@ impl Shared {
 #[derive(Default)]
 struct Actions {
     send_to: Option<(SocketAddr, String, DeviceId)>,
+    browse: Option<(SocketAddr, String)>,
     add_favorite: Option<(DeviceId, String, DeviceKind)>,
     remove_favorite: Option<DeviceId>,
     dismiss_request: Option<DeviceId>,
     dismiss_send: bool,
+    /// A new device name; empty goes back to the platform's name.
+    rename: Option<String>,
     scan: bool,
 }
+
+/// How far one Up or Down press scrolls a page that has nothing left to focus, in points.
+const TV_SCROLL_STEP: f32 = 140.0;
 
 pub struct AirLynxApp {
     shared: Arc<Mutex<Shared>>,
@@ -172,8 +182,19 @@ pub struct AirLynxApp {
     receiver_error: Option<String>,
     /// Why the last Open on the Received page did not work.
     open_error: Option<String>,
+    /// A favorite's save folder, open in place of the pages.
+    remote: Option<RemoteBrowser>,
     /// The favorite whose details are open in Settings.
     info_open: Option<DeviceId>,
+    /// The device name being typed in Settings, while the editor is open.
+    name_edit: Option<String>,
+    /// The television's zoom has been fitted to its screen (done on the first frame, when the size is known).
+    tv_fitted: bool,
+    /// An Up or Down press on the remote from the last frame: which way, and what had focus. If focus is still
+    /// there this frame, no widget took the press and the page scrolls instead (see `handle_keys`).
+    arrow_probe: Option<(f32, Option<egui::Id>)>,
+    /// Points the page still has to scroll down (negative: up), set by `handle_keys`, spent in the scroll area.
+    scroll_by: f32,
     last_scan: Instant,
     #[cfg(target_os = "android")]
     last_dir_check: Instant,
@@ -193,11 +214,11 @@ impl AirLynxApp {
             Ok(profile) => (profile, None),
             // Still usable for this session, but favorites will be lost on exit.
             Err(e) => (
-                Profile { id: DeviceId::random(), favorites: Favorites::in_memory() },
+                Profile { id: DeviceId::random(), name: None, favorites: Favorites::in_memory() },
                 Some(format!("Favorites cannot be saved: {e}")),
             ),
         };
-        let device_name = platform::device_name();
+        let device_name = profile.name.clone().unwrap_or_else(platform::device_name);
         let mut app = Self {
             shared: Arc::default(),
             cancel: Arc::default(),
@@ -213,7 +234,12 @@ impl AirLynxApp {
             receiver: None,
             receiver_error: None,
             open_error: None,
+            remote: None,
             info_open: None,
+            name_edit: None,
+            tv_fitted: false,
+            arrow_probe: None,
+            scroll_by: 0.0,
             last_scan: Instant::now(),
             #[cfg(target_os = "android")]
             last_dir_check: Instant::now(),
@@ -333,16 +359,13 @@ impl AirLynxApp {
                 return;
             }
         }
-        #[cfg(target_os = "android")]
-        let poll_interval = self.diag.experiments().poll_interval();
-        #[cfg(not(target_os = "android"))]
-        let poll_interval = receive::DEFAULT_POLL_INTERVAL;
         let config = ReceiverConfig {
             dir: self.receive_dir.clone(),
             port: DEFAULT_TCP_PORT,
             identity: self.identity.clone(),
             favorites: self.favorites.clone(),
-            poll_interval,
+            // A phone is the device that tends to sit behind NAT or a VPN, so it opens the connections.
+            reverse: cfg!(target_os = "android"),
         };
         let shared = self.shared.clone();
         let ctx = ctx.clone();
@@ -368,6 +391,64 @@ impl AirLynxApp {
 
     /// Background upkeep: periodic scans, and on Android picking up a changed save folder
     /// once the user has granted file access, and a changed light/dark setting.
+    /// The remote of an Android TV: egui moves focus from the focused widget, so the first arrow press (with nothing
+    /// focused yet) takes the first widget, and Back steps out of a view, then to the Send page, then leaves the app.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        theme::track_input(ctx);
+        let (arrow, back) = ctx.input(|i| {
+            let arrow = [egui::Key::ArrowUp, egui::Key::ArrowDown, egui::Key::ArrowLeft, egui::Key::ArrowRight].into_iter().any(|k| i.key_pressed(k));
+            (arrow, i.key_pressed(egui::Key::BrowserBack))
+        });
+        let focused = ctx.memory(|m| m.focused());
+        if arrow && focused.is_none() {
+            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::Next));
+        }
+        // Only buttons take focus, so on a page with text below the last button (Settings) Down would never get there.
+        // egui moves focus at the end of the frame, so a press that left focus where it was found no widget to go to:
+        // scroll the page instead.
+        if let Some((dir, before)) = self.arrow_probe.take()
+            && focused == before
+        {
+            self.scroll_by = dir * TV_SCROLL_STEP;
+        }
+        let (down, up) = ctx.input(|i| (i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::ArrowUp)));
+        if platform::is_tv() && focused.is_some() && (down || up) {
+            self.arrow_probe = Some((if down { 1.0 } else { -1.0 }, focused));
+        }
+        if !back {
+            return;
+        }
+        #[cfg(target_os = "android")]
+        if self.browser.take().is_some() {
+            return;
+        }
+        if self.remote.take().is_some() {
+            return;
+        }
+        if self.tab == Tab::Send {
+            platform::go_home();
+        } else {
+            self.tab = Tab::Send;
+        }
+    }
+
+    /// A television is read from a couch, but the density Android reports differs between sets (a 1080p screen
+    /// at 320 dpi is 2 pixels per point, at 213 dpi 1.33), so scale to the screen instead of a fixed factor:
+    /// the layout is `TV_POINTS_HIGH` points tall, which is 1.0 on a 1080p screen at 320 dpi.
+    fn fit_tv_zoom(&mut self, ctx: &egui::Context) {
+        const TV_POINTS_HIGH: f32 = 540.0;
+        if self.tv_fitted || !platform::is_tv() {
+            return;
+        }
+        let height = ctx.content_rect().height();
+        if height < 1.0 {
+            return;
+        }
+        self.tv_fitted = true;
+        let zoom = (height * ctx.zoom_factor() / TV_POINTS_HIGH).clamp(0.75, 2.0);
+        ctx.set_zoom_factor(zoom);
+    }
+
     fn tick(&mut self, ctx: &egui::Context) {
         let delivered = std::mem::take(&mut self.shared.lock().unwrap().delivered);
         if !delivered.is_empty() {
@@ -376,8 +457,12 @@ impl AirLynxApp {
         }
         #[cfg(target_os = "android")]
         self.take_shared_files();
+        // Every scan wakes the other devices (a phone's radio and CPU included), so scan often only while
+        // someone is looking at which devices are online.
+        let watching = ctx.input(|i| i.focused) && matches!(self.tab, Tab::Send | Tab::Settings) && !self.browsing();
+        let interval = if watching { SCAN_INTERVAL } else { IDLE_SCAN_INTERVAL };
         let scanning = self.shared.lock().unwrap().scanning;
-        if !scanning && self.last_scan.elapsed() >= SCAN_INTERVAL {
+        if !scanning && self.last_scan.elapsed() >= interval {
             self.start_scan(ctx, false);
         }
         #[cfg(target_os = "android")]
@@ -407,17 +492,22 @@ impl AirLynxApp {
         }
     }
 
-    /// The Android file browser replaces the whole screen, so the tabs are hidden while it is open.
+    /// The file browsers replace the whole screen, so the tabs are hidden while one is open.
     fn browsing(&self) -> bool {
         #[cfg(target_os = "android")]
-        return self.browser.is_some();
-        #[cfg(not(target_os = "android"))]
-        false
+        if self.browser.is_some() {
+            return true;
+        }
+        self.remote.is_some()
     }
 
     fn apply(&mut self, ctx: &egui::Context, actions: Actions) {
         if let Some((addr, name, id)) = actions.send_to {
             self.start_send(ctx, addr, name, id);
+        }
+        if let Some((addr, name)) = actions.browse {
+            let (identity, dir) = (self.identity.clone(), self.receive_dir.clone());
+            self.remote = Some(RemoteBrowser::new(ctx, identity, addr, name, dir));
         }
         if let Some((id, name, kind)) = actions.add_favorite {
             self.set_notice(self.favorites.add(id, &name, kind));
@@ -432,6 +522,9 @@ impl AirLynxApp {
         if actions.dismiss_send {
             self.shared.lock().unwrap().send = SendStatus::Idle;
         }
+        if let Some(name) = actions.rename {
+            self.rename(ctx, &name);
+        }
         if actions.scan {
             let mut s = self.shared.lock().unwrap();
             if s.scanning {
@@ -441,6 +534,21 @@ impl AirLynxApp {
                 drop(s);
                 self.start_scan(ctx, true);
             }
+        }
+    }
+
+    /// Saves the new name and announces it: the receiver and the scans copy the identity, so the receiver restarts.
+    fn rename(&mut self, ctx: &egui::Context, name: &str) {
+        match Profile::save_name(&platform::config_dir(), name) {
+            Ok(saved) => {
+                self.identity.name = Identity::new(self.identity.id, &saved.unwrap_or_else(platform::device_name)).name;
+                self.name_edit = None;
+                self.notice = None;
+                if self.receiver.is_some() {
+                    self.restart_receiver(ctx);
+                }
+            }
+            Err(e) => self.notice = Some(format!("The name cannot be saved: {e}")),
         }
     }
 
@@ -512,6 +620,7 @@ impl AirLynxApp {
                     if tab == Tab::Received && unseen > 0 {
                         badge(ui, egui::pos2(pill.right() - 6.0, pill.top() + 1.0), unseen);
                     }
+                    theme::focus_ring(ui, &response, 14);
                     if response.clicked() {
                         self.tab = tab;
                     }
@@ -550,6 +659,7 @@ impl AirLynxApp {
                     if tab == Tab::Received && unseen > 0 {
                         badge(ui, rect.right_center() - vec2(20.0, 0.0), unseen);
                     }
+                    theme::focus_ring(ui, &response, 10);
                     if response.clicked() {
                         self.tab = tab;
                     }
@@ -779,41 +889,52 @@ impl AirLynxApp {
         };
         let border = target.map(|_| p.accent);
         theme::card(ui, border, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 theme::tile(ui, device_icon(kind), 44.0, if live.is_some() { Tint::Accent } else { Tint::Muted });
-                let mid_w = (ui.available_width() - 92.0 - 12.0).max(40.0);
-                ui.allocate_ui_with_layout(vec2(mid_w, 44.0), Layout::top_down(Align::Min), |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                let can_browse = target.is_none() && live.is_some_and(|peer| peer.mutual);
+                // The name gets the full width next to the tile. The status and the buttons share the row below.
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
                     let name_color = if live.is_some() { p.text } else { p.sub };
                     ui.add(egui::Label::new(RichText::new(&fav.name).family(theme::bold()).size(15.5).color(name_color)).truncate());
-                    if let Some(progress) = target {
-                        ui.label(
-                            RichText::new(format!("Sending, file {} of {}", progress.file_index + 1, progress.file_count))
-                                .size(13.0)
-                                .color(p.accent_text),
-                        );
-                    } else {
-                        match live {
-                            None => theme::status_line(ui, p.off, p.sub, "Offline"),
-                            Some(peer) if peer.mutual => theme::status_line(ui, p.ok, p.ok, "Online"),
-                            Some(_) => theme::status_line(ui, p.warn, p.warn, "Not faved you"),
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(theme::control_height());
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if let Some(progress) = target {
+                            ui.label(
+                                RichText::new(format!("Sending, file {} of {}", progress.file_index + 1, progress.file_count))
+                                    .size(13.0)
+                                    .color(p.accent_text),
+                            );
+                        } else {
+                            match live {
+                                None => theme::status_line(ui, p.off, p.sub, "Offline"),
+                                Some(peer) if peer.mutual => theme::status_line(ui, p.ok, p.ok, "Online"),
+                                Some(_) => theme::status_line(ui, p.warn, p.warn, "Not faved you"),
+                            }
                         }
-                    }
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if target.is_some() {
-                        if theme::button(ui, Kind::Secondary, None, "Cancel", true).clicked() {
-                            self.cancel.store(true, Ordering::Relaxed);
-                        }
-                    } else {
-                        let can_send = !sending && !self.files.is_empty() && live.is_some_and(|peer| peer.mutual);
-                        if theme::button(ui, Kind::Primary, Some(Icon::Send), "Send", can_send).clicked()
-                            && let Some(peer) = live
-                        {
-                            actions.send_to = Some((peer.addr, fav.name.clone(), fav.id));
-                        }
-                    }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if target.is_some() {
+                                if theme::button(ui, Kind::Secondary, None, "Cancel", true).clicked() {
+                                    self.cancel.store(true, Ordering::Relaxed);
+                                }
+                            } else {
+                                let can_send = !sending && !self.files.is_empty() && live.is_some_and(|peer| peer.mutual);
+                                if theme::button(ui, Kind::Primary, Some(Icon::Send), "Send", can_send).clicked()
+                                    && let Some(peer) = live
+                                {
+                                    actions.send_to = Some((peer.addr, fav.name.clone(), fav.id));
+                                }
+                                if can_browse
+                                    && theme::icon_button(ui, Icon::Folder, "Browse files").clicked()
+                                    && let Some(peer) = live
+                                {
+                                    actions.browse = Some((peer.addr, fav.name.clone()));
+                                }
+                            }
+                        });
+                    });
                 });
             });
             if let Some(progress) = target {
@@ -953,12 +1074,39 @@ impl AirLynxApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 theme::tile(ui, device_icon(platform::device_kind()), 44.0, Tint::Accent);
-                ui.vertical(|ui| {
+                let mid_w = (ui.available_width() - 80.0 - 12.0).max(40.0);
+                ui.allocate_ui_with_layout(vec2(mid_w, 44.0), Layout::top_down(Align::Min), |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new(&self.identity.name).family(theme::bold()).size(15.5));
+                    ui.add(egui::Label::new(RichText::new(&self.identity.name).family(theme::bold()).size(15.5)).truncate());
                     theme::sub(ui, &format!("Visible to nearby devices, id {}", self.identity.id.short()));
                 });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.name_edit.is_none() && theme::button(ui, Kind::Text, None, "Rename", true).clicked() {
+                        self.name_edit = Some(self.identity.name.clone());
+                    }
+                });
             });
+            let mut cancel = false;
+            if let Some(text) = &mut self.name_edit {
+                ui.add_space(8.0);
+                ui.add(egui::TextEdit::singleline(text).hint_text("Device name").desired_width(f32::INFINITY));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let ready = !text.trim().is_empty();
+                    if theme::button(ui, Kind::Primary, None, "Save", ready).clicked() {
+                        actions.rename = Some(text.clone());
+                    }
+                    if theme::button(ui, Kind::Text, None, "Use device name", true).clicked() {
+                        actions.rename = Some(String::new());
+                    }
+                    if theme::button(ui, Kind::Text, None, "Cancel", true).clicked() {
+                        cancel = true;
+                    }
+                });
+            }
+            if cancel {
+                self.name_edit = None;
+            }
         });
 
         theme::section(ui, "Receiving", None);
@@ -1004,9 +1152,12 @@ impl AirLynxApp {
                 if platform::has_all_files_access() {
                     ui.label(RichText::new("Allowed").size(13.0).family(theme::bold()).color(p.ok));
                 } else {
-                    ui.label(RichText::new("Grant file access to save into Download/AirLynx instead.").size(13.0).color(p.sub));
+                    ui.label(RichText::new("Received files are hidden in Android/data until you grant file access. Grant it to save into Download/AirLynx instead.").size(13.0).color(p.sub));
                     if theme::button(ui, Kind::Secondary, None, "Grant file access", true).clicked() {
                         platform::request_all_files_access();
+                    }
+                    if platform::is_tv() {
+                        ui.label(RichText::new("Most TVs have no screen for this. From a computer: adb shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow").size(13.0).color(p.sub));
                     }
                 }
             }
@@ -1153,10 +1304,9 @@ impl AirLynxApp {
             );
             ui.checkbox(&mut experiments.receiver, "Receiver on (off is the control run)");
             ui.add_enabled_ui(experiments.receiver, |ui| {
-                ui.checkbox(&mut experiments.wake_lock, "CPU wake lock");
-                ui.checkbox(&mut experiments.wifi_lock, "Wi-Fi high-performance lock");
+                ui.checkbox(&mut experiments.wake_lock, "CPU wake lock during transfers");
+                ui.checkbox(&mut experiments.wifi_lock, "Wi-Fi high-performance lock during transfers");
                 ui.checkbox(&mut experiments.multicast_lock, "Multicast lock");
-                ui.checkbox(&mut experiments.slow_poll, "Slow polling (1 s instead of 0.1 s)");
             });
         });
         if experiments != self.diag.experiments() {
@@ -1172,7 +1322,7 @@ impl AirLynxApp {
         platform::set_keep_awake(false);
         crate::android::set_keep(experiments.keep());
         self.start_receiver(ctx);
-        // Stopping the old receiver takes up to a couple of seconds, which should not count.
+        // Stopping the old receiver should not count.
         self.diag.reset();
     }
 }
@@ -1194,6 +1344,7 @@ fn device_icon(kind: DeviceKind) -> Icon {
     match kind {
         DeviceKind::Desktop => Icon::Computer,
         DeviceKind::Mobile => Icon::Phone,
+        DeviceKind::Tv => Icon::Tv,
         DeviceKind::Macsplorer => Icon::Macsplorer,
         DeviceKind::Unknown => Icon::Unknown,
     }
@@ -1270,7 +1421,8 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
                 at: Instant::now(),
             });
         }
-        ReceiveEvent::Connected { .. } => {}
+        // Looking into the save folder, or taking a file from it, shows nothing in History.
+        ReceiveEvent::Connected { .. } | ReceiveEvent::Listed { .. } | ReceiveEvent::Served { .. } => {}
         ReceiveEvent::FileStarted { peer, name, size } => {
             s.incoming.retain(|i| i.peer != peer);
             let from = s.name_for(&peer);
@@ -1282,6 +1434,7 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
             }
         }
         ReceiveEvent::FileSaved { peer, path, size } => {
+            platform::scan_file(&path);
             s.incoming.retain(|i| i.peer != peer);
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let from = s.name_for(&peer);
@@ -1307,6 +1460,11 @@ fn handle_receive_event(s: &mut Shared, event: ReceiveEvent) {
 fn sync_theme(ctx: &egui::Context) {
     if let Some(dark) = platform::is_dark_mode() {
         ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+        // Only on a change: the call goes through the UI thread.
+        static LAST: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+        if LAST.swap(dark as i8, Ordering::Relaxed) != dark as i8 {
+            platform::set_system_bar_icons(dark);
+        }
     }
 }
 
@@ -1314,6 +1472,8 @@ impl eframe::App for AirLynxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.tick(&ctx);
+        self.fit_tv_zoom(&ctx);
+        self.handle_keys(&ctx);
 
         #[cfg(not(target_os = "android"))]
         {
@@ -1364,6 +1524,13 @@ impl eframe::App for AirLynxApp {
                     return;
                 }
 
+                if let Some(remote) = &mut self.remote {
+                    if let remote::Action::Close = remote.ui(ui, &ctx) {
+                        self.remote = None;
+                    }
+                    return;
+                }
+
                 if let Some(notice) = &self.notice {
                     theme::banner(ui, p.err_soft, |ui| {
                         ui.label(RichText::new(notice).color(p.err));
@@ -1375,6 +1542,9 @@ impl eframe::App for AirLynxApp {
                 }
                 let mut actions = Actions::default();
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    if self.scroll_by != 0.0 {
+                        ui.scroll_with_delta(vec2(0.0, -std::mem::take(&mut self.scroll_by)));
+                    }
                     ui.spacing_mut().item_spacing.y = 8.0;
                     match self.tab {
                         Tab::Send => self.send_page(ui, &ctx, &shared, wide, &mut actions),

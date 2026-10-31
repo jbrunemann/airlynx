@@ -50,7 +50,7 @@ impl Ephemeral {
             if is_sender { (self.public, peer_public) } else { (peer_public, self.public) };
         let key = |label: &[u8]| {
             let mut h = Sha256::new();
-            h.update(b"airlynx v4 ");
+            h.update(b"airlynx v6 ");
             h.update(label);
             h.update(shared);
             h.update(sender_pub);
@@ -93,6 +93,13 @@ fn nonce(count: u64) -> Nonce {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&count.to_be_bytes());
     *Nonce::from_slice(&n)
+}
+
+impl<S> SecureStream<S> {
+    /// The stream underneath, for socket options such as timeouts.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
 }
 
 impl<S: Write> SecureStream<S> {

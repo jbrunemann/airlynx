@@ -110,9 +110,18 @@ def monochrome():
     return svg(f'{body}<rect width="1024" height="1024" fill="white" mask="url(#m)"/>')
 
 
-def render(svg_text, size, dest):
+def banner():
+    """Android TV home screen banner, 320 by 180: the mark on the icon gradient, with the name."""
+    mark = f'<g transform="translate(14 14) scale(0.15)">{glyph(FUR, NAVY, AMBER)}</g>'
+    name = ('<text x="172" y="101" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="36" '
+            'font-weight="700" fill="white">AirLynx</text>')
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180">'
+            f'<defs>{BG_GRADIENT}</defs><rect width="320" height="180" fill="url(#bg)"/>{mark}{name}</svg>')
+
+
+def render(svg_text, size, dest, height=None):
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(size), "-o", dest],
+    subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(height or size), "-o", dest],
                    input=svg_text.encode(), check=True)
 
 
@@ -132,6 +141,7 @@ def main():
         render(adaptive_background(), px, os.path.join(RES, f"drawable-{name}", "ic_launcher_background.png"))
         render(adaptive_foreground(), px, os.path.join(RES, f"drawable-{name}", "ic_launcher_foreground.png"))
         render(monochrome(), px, os.path.join(RES, f"drawable-{name}", "ic_launcher_monochrome.png"))
+    render(banner(), 320, os.path.join(RES, "drawable-xhdpi", "banner.png"), height=180)
     write(os.path.join(RES, "mipmap-anydpi-v26", "ic_launcher.xml"),
           '<?xml version="1.0" encoding="utf-8"?>\n'
           '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
@@ -139,6 +149,12 @@ def main():
           '    <foreground android:drawable="@drawable/ic_launcher_foreground"/>\n'
           '    <monochrome android:drawable="@drawable/ic_launcher_monochrome"/>\n'
           '</adaptive-icon>\n')
+
+    # Linux: the freedesktop icon theme layout, which the desktop's menu and dock look in (they ignore a lone 512 px png).
+    hicolor = os.path.join(ROOT, "assets", "hicolor")
+    for px in (16, 32, 48, 64, 128, 256, 512):
+        render(full_icon(), px, os.path.join(hicolor, f"{px}x{px}", "apps", "airlynx.png"))
+    write(os.path.join(hicolor, "scalable", "apps", "airlynx.svg"), full_icon())
 
     # macOS .icns
     with tempfile.TemporaryDirectory() as tmp:

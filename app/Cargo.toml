@@ -30,11 +30,26 @@ winit = { version = "0.30.13", features = ["android-native-activity"] }
 package = "dev.airlynx.app"
 apk_name = "AirLynx"
 resources = "res"
-build_targets = ["aarch64-linux-android"]
+# armv7 is for TVs with a 32-bit userland (the Philips PUS8545 is one, as far as we know).
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
 
 [package.metadata.android.sdk]
 min_sdk_version = 30
 target_sdk_version = 34
+
+# Android TV: no touch screen, and the launcher is the leanback one. Both stay optional so phones still install it.
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.touchscreen"
+required = false
+
+[[package.metadata.android.uses_feature]]
+name = "android.software.leanback"
+required = false
+
+# The portrait lock below would otherwise make aapt require this feature, which a TV does not have.
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.screen.portrait"
+required = false
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
@@ -78,7 +93,14 @@ exported = true
 # finishes (the app hangs and gets an ANR). Changes missing here that really happen: mcc/mnc (the SIM
 # registering, roaming), fontScale, locale. The list is every value Android defines.
 config_changes = "mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|layoutDirection|fontScale|density|colorMode|fontWeightAdjustment"
-orientation = "portrait"
+orientation = "portrait" # MainActivity switches a television to landscape
+
+# The launcher entry. Supplying any MAIN filter makes cargo-apk drop its default one, so the phone launcher is listed
+# here too. The Android TV home screen lists only activities with LEANBACK_LAUNCHER (its banner is patched in by
+# build-apk.sh).
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER", "android.intent.category.LEANBACK_LAUNCHER"]
 
 # "Share to AirLynx" from any app: one file, several files, or text.
 [[package.metadata.android.application.activity.intent_filter]]

@@ -13,8 +13,9 @@ use jni::{JNIEnv, JavaVM};
 
 static APP: OnceLock<AndroidApp> = OnceLock::new();
 
-/// Which locks `set_keep_awake` takes. All of them by default; the Diagnostics card turns them off one by
-/// one to measure what each costs in battery.
+/// Which locks the receiver takes. All of them by default; the Diagnostics card turns them off one by
+/// one to measure what each costs in battery. The wake and Wi-Fi locks are held only while a session runs
+/// (see `set_busy`), the multicast lock the whole time the receiver listens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Keep {
     pub wake_lock: bool,
@@ -34,11 +35,16 @@ static KEEP: Mutex<Keep> = Mutex::new(Keep { wake_lock: true, wifi_lock: true, m
 struct Held {
     /// The foreground service is running.
     active: bool,
+    /// A session is running (see `set_busy`).
+    busy: bool,
     /// Locks taken while receiving, by name.
     locks: Vec<(&'static str, GlobalRef)>,
 }
 
-static HELD: Mutex<Held> = Mutex::new(Held { active: false, locks: Vec::new() });
+static HELD: Mutex<Held> = Mutex::new(Held { active: false, busy: false, locks: Vec::new() });
+
+/// The locks held only during a session.
+const SESSION_LOCKS: [&str; 2] = ["wake", "wifi"];
 
 pub fn init(app: AndroidApp) {
     let _ = APP.set(app);
@@ -83,7 +89,7 @@ fn java_string(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> jni::errors::Result<St
 }
 
 pub fn device_kind() -> DeviceKind {
-    DeviceKind::Mobile
+    if is_tv() { DeviceKind::Tv } else { DeviceKind::Mobile }
 }
 
 pub fn device_name() -> String {
@@ -163,6 +169,32 @@ pub fn has_all_files_access() -> bool {
             .z()
     })
     .unwrap_or(false)
+}
+
+/// Whether the device is a television (UI mode type TELEVISION): no touch screen, a remote with a D-pad.
+pub fn is_tv() -> bool {
+    static TV: OnceLock<bool> = OnceLock::new();
+    *TV.get_or_init(|| {
+        with_env(|env, activity| env.call_method(activity, "isTelevision", "()Z", &[])?.z()).unwrap_or(false)
+    })
+}
+
+/// Moves the task to the back, like Home. The receiver keeps running in its foreground service, so this is
+/// what Back does on the first page instead of finishing the activity.
+pub fn go_home() {
+    with_env(|env, activity| {
+        env.call_method(activity, "moveTaskToBack", "(Z)Z", &[JValue::Bool(1)])?;
+        Ok(())
+    });
+}
+
+/// Adds a saved file to Android's media index so file managers' Downloads and Recent views list it.
+pub fn scan_file(path: &Path) {
+    with_env(|env, activity| {
+        let path = env.new_string(path.to_string_lossy())?;
+        env.call_method(activity, "scanFile", "(Ljava/lang/String;)V", &[JValue::Object(&path)])?;
+        Ok(())
+    });
 }
 
 /// Opens a received file in whichever app handles its type. `MainActivity::openFile` hands the other app a
@@ -272,7 +304,7 @@ fn set_receive_service(on: bool) {
     });
 }
 
-/// Chooses which locks the next `set_keep_awake(true)` takes.
+/// Chooses which locks the next `set_keep_awake(true)` and `set_busy(true)` take.
 pub fn set_keep(keep: Keep) {
     *KEEP.lock().unwrap() = keep;
 }
@@ -284,36 +316,77 @@ fn acquire(env: &mut JNIEnv<'_>, lock: &JObject<'_>) -> jni::errors::Result<Glob
     env.new_global_ref(lock)
 }
 
+fn release(lock: &GlobalRef) {
+    with_env(|env, _| {
+        if env.call_method(lock, "isHeld", "()Z", &[])?.z()? {
+            env.call_method(lock, "release", "()V", &[])?;
+        }
+        Ok(())
+    });
+}
+
 /// Keeps the app able to receive with the screen locked: a foreground service (so the process is not
-/// frozen or cut off from the network), plus the locks chosen with `set_keep`. A CPU wake lock keeps
-/// incoming connections from stalling, a Wi-Fi lock keeps the radio awake, and a multicast lock makes
-/// the radio deliver the broadcast packets that discovery uses (many devices drop them otherwise).
+/// frozen or cut off from the network) and, if chosen with `set_keep`, a multicast lock, which makes the
+/// radio deliver the broadcast packets that discovery uses (many devices drop them otherwise).
+/// The phone may sleep in between: an incoming connection or discovery packet wakes it, and `set_busy`
+/// keeps it awake for the session that follows.
 pub fn set_keep_awake(on: bool) {
     let mut held = HELD.lock().unwrap();
     if !on {
         set_receive_service(false);
         held.active = false;
-        for (_, lock) in held.locks.drain(..) {
-            with_env(|env, _| {
-                if env.call_method(&lock, "isHeld", "()Z", &[])?.z()? {
-                    env.call_method(&lock, "release", "()V", &[])?;
-                }
-                Ok(())
-            });
-        }
+        held.locks.drain(..).for_each(|(_, lock)| release(&lock));
         return;
     }
     if held.active {
         return;
     }
     held.active = true;
-    let keep = *KEEP.lock().unwrap();
     set_receive_service(true);
+    let keep = *KEEP.lock().unwrap();
+    if keep.multicast_lock {
+        take_locks(&mut held, &["multicast"]);
+    }
+    if held.busy {
+        take_session_locks(&mut held, keep);
+    }
+}
+
+/// Called from `airlynx_core::busy` when the first session starts and when the last one ends. While one runs,
+/// a CPU wake lock keeps the transfer from stalling when the phone would sleep, and a Wi-Fi lock keeps the radio
+/// at full speed. Both are what drains the battery while idle, so they are not held then.
+pub fn set_busy(busy: bool) {
+    let mut held = HELD.lock().unwrap();
+    held.busy = busy;
+    if !held.active {
+        return;
+    }
+    if busy {
+        take_session_locks(&mut held, *KEEP.lock().unwrap());
+    } else {
+        let (session, rest): (Vec<_>, Vec<_>) = held.locks.drain(..).partition(|(name, _)| SESSION_LOCKS.contains(name));
+        held.locks = rest;
+        session.iter().for_each(|(_, lock)| release(lock));
+    }
+}
+
+fn take_session_locks(held: &mut Held, keep: Keep) {
+    let names: Vec<&str> = [("wake", keep.wake_lock), ("wifi", keep.wifi_lock)]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect();
+    take_locks(held, &names);
+}
+
+/// Creates and acquires the locks named in `names` that are not held yet.
+fn take_locks(held: &mut Held, names: &[&str]) {
+    let wanted = |name: &str| names.contains(&name) && !held.locks.iter().any(|(n, _)| *n == name);
+    let (wake, wifi, multicast) = (wanted("wake"), wanted("wifi"), wanted("multicast"));
     with_env(|env, activity| {
         let context = env
             .call_method(activity, "getApplicationContext", "()Landroid/content/Context;", &[])?
             .l()?;
-        if keep.wake_lock {
+        if wake {
             let power = system_service(env, &context, "power")?;
             let tag = env.new_string("airlynx:receive")?;
             // PARTIAL_WAKE_LOCK = 1
@@ -327,14 +400,14 @@ pub fn set_keep_awake(on: bool) {
                 .l()?;
             held.locks.push(("wake", acquire(env, &wake)?));
         }
-        if keep.wifi_lock || keep.multicast_lock {
-            let wifi = system_service(env, &context, "wifi")?;
+        if wifi || multicast {
+            let manager = system_service(env, &context, "wifi")?;
             let tag = env.new_string("airlynx")?;
-            if keep.wifi_lock {
+            if wifi {
                 // WIFI_MODE_FULL_HIGH_PERF = 3 (deprecated since API 34 but still honored)
                 let lock = env
                     .call_method(
-                        &wifi,
+                        &manager,
                         "createWifiLock",
                         "(ILjava/lang/String;)Landroid/net/wifi/WifiManager$WifiLock;",
                         &[JValue::Int(3), JValue::Object(&tag)],
@@ -342,10 +415,10 @@ pub fn set_keep_awake(on: bool) {
                     .l()?;
                 held.locks.push(("wifi", acquire(env, &lock)?));
             }
-            if keep.multicast_lock {
+            if multicast {
                 let lock = env
                     .call_method(
-                        &wifi,
+                        &manager,
                         "createMulticastLock",
                         "(Ljava/lang/String;)Landroid/net/wifi/WifiManager$MulticastLock;",
                         &[JValue::Object(&tag)],
@@ -562,6 +635,15 @@ pub fn is_dark_mode() -> Option<bool> {
         // UI_MODE_NIGHT_MASK is 0x30 and UI_MODE_NIGHT_YES is 0x20.
         Ok(mode & 0x30 == 0x20)
     })
+}
+
+/// Tells Android whether the app is drawing a light or dark background under the system bars, so it
+/// picks dark or light icons. Without this the icons follow Android's own theme and can match the app.
+pub fn set_system_bar_icons(dark_mode: bool) {
+    with_env(|env, activity| {
+        env.call_method(activity, "setSystemBarIcons", "(Z)V", &[JValue::Bool((!dark_mode).into())])?;
+        Ok(())
+    });
 }
 
 /// Height of the navigation bar (or gesture bar) in physical pixels. NativeActivity draws

@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,7 +19,9 @@ use std::time::{Duration, Instant};
 use crate::identity::{DeviceId, DeviceKind, Favorites, Identity, Route, clean_name};
 use crate::mdns;
 use crate::protocol::{ANNOUNCE_PREFIX, DISCOVER_PREFIX, DISCOVERY_PORT};
+use crate::reverse;
 use crate::stats;
+use crate::stop::Stop;
 
 /// How often a running scan looks for addresses mDNS has found since it started.
 const MDNS_POLL: Duration = Duration::from_millis(250);
@@ -37,29 +38,32 @@ pub struct Peer {
 
 /// Binds the discovery port. Done separately from `spawn_responder` so bind
 /// errors surface to the caller instead of inside a background thread.
-pub(crate) fn bind_responder(poll_interval: Duration) -> io::Result<UdpSocket> {
-    bind_responder_on(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT, poll_interval)
+pub(crate) fn bind_responder() -> io::Result<UdpSocket> {
+    bind_responder_on(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)
 }
 
-fn bind_responder_on(ip: Ipv4Addr, port: u16, poll_interval: Duration) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind((ip, port))?;
-    socket.set_read_timeout(Some(poll_interval))?;
-    Ok(socket)
+fn bind_responder_on(ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
+    UdpSocket::bind((ip, port))
 }
 
-/// Answers discovery broadcasts until `stop` is set.
+/// Answers discovery broadcasts until `stop` is set. The socket blocks without a timeout, so whoever sets `stop`
+/// also sends it a packet to wake it.
 pub(crate) fn spawn_responder(
     socket: UdpSocket,
     tcp_port: u16,
     me: Identity,
     favorites: Favorites,
-    stop: Arc<AtomicBool>,
+    stop: Stop,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut buf = [0u8; 256];
-        while !stop.load(Ordering::Relaxed) {
+        loop {
+            let received = socket.recv_from(&mut buf);
             stats::discovery_poll();
-            match socket.recv_from(&mut buf) {
+            if stop.is_set() {
+                break;
+            }
+            match received {
                 Ok((n, from)) => {
                     let Some(asker) = parse_request(&buf[..n]) else { continue };
                     let mutual = u8::from(favorites.contains(asker));
@@ -67,7 +71,6 @@ pub(crate) fn spawn_responder(
                     let _ = socket.send_to(reply.as_bytes(), from);
                     stats::discovery_reply();
                 }
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
                 Err(_) => thread::sleep(Duration::from_millis(200)),
             }
         }
@@ -188,12 +191,20 @@ fn discover_on(port: u16, me: &Identity, wait: Duration, hints: &[IpAddr]) -> io
 }
 
 /// Like `discover_with`, using the last known address of every favorite, and remembering what it
-/// learns about the favorites it finds (address, port, route) for next time.
+/// learns about the favorites it finds (address, port, route) for next time. A favorite that could not be found
+/// but has connected to us to be asked for sessions (see `reverse`) is listed too, at the address of that connection.
 pub fn scan(me: &Identity, favorites: &Favorites, wait: Duration) -> io::Result<Vec<Peer>> {
-    let peers = discover_with(me, wait, &favorites.known_addresses())?;
+    let mut peers = discover_with(me, wait, &favorites.known_addresses())?;
     for peer in &peers {
         if favorites.contains(peer.id) {
             favorites.remember_peer(peer.id, peer.addr.ip(), peer.addr.port(), peer.mutual, route_to(peer.addr.ip()));
+        }
+    }
+    for standby in reverse::standby_peers() {
+        if standby.id != me.id && !peers.iter().any(|p| p.id == standby.id) {
+            let kind = favorites.list().iter().find(|f| f.id == standby.id).map(|f| f.kind).unwrap_or_default();
+            // It dials favorites only, and we only accept a connection from one of ours, so it has us as a favorite.
+            peers.push(Peer { addr: standby.addr, id: standby.id, name: standby.name, mutual: true, kind });
         }
     }
     Ok(peers)
@@ -321,11 +332,19 @@ mod tests {
 
     /// Starts a responder for `id` on an ephemeral loopback port, as another device would run it. Being
     /// bound to loopback, it can't hear broadcasts, only a direct question.
-    fn responder(id: DeviceId, favorites: Favorites, stop: &Arc<AtomicBool>) -> (u16, JoinHandle<()>) {
-        let socket = bind_responder_on(Ipv4Addr::LOCALHOST, 0, Duration::from_millis(50)).unwrap();
+    fn responder(id: DeviceId, favorites: Favorites, stop: &Stop) -> (u16, JoinHandle<()>) {
+        let socket = bind_responder_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = socket.local_addr().unwrap().port();
         let me = Identity::new(id, "Test phone").with_kind(DeviceKind::Mobile);
         (port, spawn_responder(socket, 47800, me, favorites, stop.clone()))
+    }
+
+    /// Stops the responder the way the receiver does: set the signal, then wake the socket with a packet.
+    fn stop_responder(stop: &Stop, port: u16, thread: JoinHandle<()>) {
+        stop.set();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        udp.send_to(b"", (Ipv4Addr::LOCALHOST, port)).unwrap();
+        thread.join().unwrap();
     }
 
     #[test]
@@ -333,13 +352,12 @@ mod tests {
         let (asker, other) = (Identity::new(DeviceId::random(), "Mac"), DeviceId::random());
         let favorites = Favorites::in_memory();
         favorites.add(asker.id, "Mac", DeviceKind::Desktop).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Stop::default();
         let (port, thread) = responder(other, favorites, &stop);
 
         let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
         let found = discover_on(port, &asker, Duration::from_millis(600), &[loopback, loopback]).unwrap();
-        stop.store(true, Ordering::Relaxed);
-        thread.join().unwrap();
+        stop_responder(&stop, port, thread);
 
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].id, found[0].mutual, found[0].kind), (other, true, DeviceKind::Mobile));
@@ -349,11 +367,10 @@ mod tests {
     #[test]
     fn without_a_hint_nothing_is_found() {
         let asker = Identity::new(DeviceId::random(), "Mac");
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Stop::default();
         let (port, thread) = responder(DeviceId::random(), Favorites::in_memory(), &stop);
         let found = discover_on(port, &asker, Duration::from_millis(300), &[]).unwrap();
-        stop.store(true, Ordering::Relaxed);
-        thread.join().unwrap();
+        stop_responder(&stop, port, thread);
         assert!(found.is_empty());
     }
 
