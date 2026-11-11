@@ -182,6 +182,9 @@ pub struct AirLynxApp {
     receiver_error: Option<String>,
     /// Why the last Open on the Received page did not work.
     open_error: Option<String>,
+    /// The file whose path was last copied to the clipboard (desktop), so its row can say so.
+    #[cfg(not(target_os = "android"))]
+    copied_path: Option<PathBuf>,
     /// A favorite's save folder, open in place of the pages.
     remote: Option<RemoteBrowser>,
     /// The favorite whose details are open in Settings.
@@ -234,6 +237,8 @@ impl AirLynxApp {
             receiver: None,
             receiver_error: None,
             open_error: None,
+            #[cfg(not(target_os = "android"))]
+            copied_path: None,
             remote: None,
             info_open: None,
             name_edit: None,
@@ -1032,18 +1037,24 @@ impl AirLynxApp {
                 }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
-                    if item.ok {
-                        theme::tile(ui, Icon::File, 36.0, Tint::Accent);
-                    } else {
-                        theme::tile(ui, Icon::Warning, 36.0, Tint::Error);
-                    }
+                    // On desktop the icon and the name answer clicks: a left click on the icon copies the path,
+                    // a right click on either opens a menu. Android keeps plain, hover-only widgets.
+                    let sense = if cfg!(target_os = "android") { Sense::hover() } else { Sense::click() };
+                    let icon = if item.ok { theme::tile_sense(ui, Icon::File, 36.0, Tint::Accent, sense) } else { theme::tile_sense(ui, Icon::Warning, 36.0, Tint::Error, sense) };
                     let open = item.ok && item.path.is_some();
                     let mid_w = (ui.available_width() - if open { 60.0 } else { 0.0 } - 12.0).max(40.0);
+                    let mut name_response = None;
+                    #[cfg(not(target_os = "android"))]
+                    let copied_here = item.path.is_some() && self.copied_path == item.path;
+                    #[cfg(target_os = "android")]
+                    let copied_here = false;
                     ui.allocate_ui_with_layout(vec2(mid_w, 36.0), Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.add(egui::Label::new(RichText::new(&item.name).size(14.5)).truncate());
+                        name_response = Some(ui.add(egui::Label::new(RichText::new(&item.name).size(14.5)).truncate().sense(sense)));
                         let ago = ago(item.at.elapsed());
-                        let (detail, color) = if item.ok {
+                        let (detail, color) = if copied_here {
+                            ("Path copied to the clipboard".to_string(), p.accent_text)
+                        } else if item.ok {
                             (format!("{} from {}, {ago}", human_size(item.size), item.from), p.sub)
                         } else {
                             (format!("{}, from {}, {ago}", item.note, item.from), p.err)
@@ -1059,9 +1070,47 @@ impl AirLynxApp {
                             }
                         });
                     }
+                    #[cfg(not(target_os = "android"))]
+                    if let (Some(path), true) = (&item.path, item.ok) {
+                        self.path_menu(icon, name_response, path);
+                    }
+                    #[cfg(target_os = "android")]
+                    let _ = (icon, name_response);
                 });
             }
         });
+    }
+
+    /// Desktop: left click on the icon copies the file's full path to the clipboard, right click on the icon or the
+    /// name opens a menu with Copy path and Open.
+    #[cfg(not(target_os = "android"))]
+    fn path_menu(&mut self, icon: egui::Response, name: Option<egui::Response>, path: &std::path::Path) {
+        let icon = icon.on_hover_text("Click to copy the path, right click for more");
+        let mut copy = icon.clicked();
+        let mut open = false;
+        let mut menu = |ui: &mut egui::Ui| {
+            if ui.button("Copy path").clicked() {
+                copy = true;
+                ui.close();
+            }
+            if ui.button("Open").clicked() {
+                open = true;
+                ui.close();
+            }
+        };
+        icon.context_menu(&mut menu);
+        if let Some(name) = name {
+            name.context_menu(&mut menu);
+        }
+        if copy {
+            // The full path, made absolute in case the save folder was given relative.
+            let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            icon.ctx.copy_text(full.to_string_lossy().into_owned());
+            self.copied_path = Some(path.to_path_buf());
+        }
+        if open {
+            self.open_error = platform::open_file(path).err();
+        }
     }
 
     // ---- settings page ------------------------------------------------------------------------

@@ -322,15 +322,21 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
 
 /// A rounded tile with an icon, used for files and devices.
 pub fn tile(ui: &mut Ui, icon: Icon, size: f32, tint: Tint) {
+    tile_sense(ui, icon, size, tint, Sense::hover());
+}
+
+/// A tile that also answers clicks, for tiles that act as a button.
+pub fn tile_sense(ui: &mut Ui, icon: Icon, size: f32, tint: Tint, sense: Sense) -> Response {
     let p = pal(ui);
     let (fill, fg) = match tint {
         Tint::Accent => (p.accent_soft, p.accent_text),
         Tint::Muted => (p.disabled_fill, p.disabled_text),
         Tint::Error => (p.err_soft, p.err),
     };
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), sense);
     ui.painter().rect_filled(rect, CornerRadius::same((size * 0.27) as u8), fill);
     icon.paint(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(size * 0.54)), fg, 1.8);
+    response
 }
 
 #[derive(Clone, Copy)]

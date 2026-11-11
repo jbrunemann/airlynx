@@ -266,6 +266,9 @@ The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `ap
 - **Browsing a favorite:** an online favorite that has added this device shows a folder button next to Send. It opens that
   device's save folder in place of the pages (tabs hidden, like the Android file picker): tap a folder to open it, **Up** to go back,
   **Get** to download a file into this device's save folder. One download at a time. Not cancellable yet.
+- **Received history (desktop):** each received file has an **Open** button. A left click on its icon copies the file's full absolute path to the
+  system clipboard (`ctx.copy_text`) and the row says "Path copied to the clipboard". A right click on the icon or the name opens a menu with
+  **Copy path** and **Open**. Android has only Open.
 - **Flow:** choose files, then press **Send** on an online, mutual favorite. While sending, that card shows the
   progress bar, byte counts and **Cancel**, and the other Send buttons are disabled. The result is a dismissible
   banner at the top of Send. The Received tab badge counts unseen files plus pending requests.
