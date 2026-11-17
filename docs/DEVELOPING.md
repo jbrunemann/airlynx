@@ -1,0 +1,514 @@
+# AirLynx developer guide
+
+The user-facing overview is in the [README](../README.md). This file covers architecture, protocol, build and test workflow, gotchas and the roadmap.
+
+Local-network file transfer between Android and macOS (and anything else that runs Rust).
+Devices find each other with UDP broadcast on every interface, mDNS, and the last known address of each favorite. Files go over TCP, encrypted, with a SHA-256 check per file.
+
+**Favorites:** each install has a random device id. A device only accepts files from devices it has
+added as favorites. When two devices have added each other (a mutual favorite), either one can send to
+the other at any time, with no prompt. The receiver is always on while the app is open, and a device
+never lists itself under Add a device.
+
+**Status:** working prototype (v0.3.0). The favorites flow was tested end to end between two CLI
+profiles on one Mac. The v0.2 send/receive flows were tested on a Pixel 3a API 34 emulator and on macOS.
+The redesigned UI (see "UI design") was checked on the emulator in light and dark mode. Its desktop
+layout (sidebar, two columns) has only been compiled, not looked at, because screen capture was unavailable.
+It has not been tested on a physical phone yet.
+
+---
+
+## Quick start
+
+```sh
+# macOS app (starts receiving on launch, saves to ~/Downloads/AirLynx)
+./scripts/bundle-macos.sh && open target/release/AirLynx.app
+cargo run --release -p airlynx-app          # or run without bundling
+
+# Android APK (Android 11+): AirLynx.apk (arm64) and AirLynx-armv7.apk (32-bit TVs)
+./scripts/build-apk.sh                      # -> target/release/apk/AirLynx.apk and AirLynx-armv7.apk
+./scripts/build-apk.sh --install            # build + adb install (the arm64 one)
+
+# Linux (desktop app, CLI, icon and menu entry for Xfce/GNOME/KDE): one tarball per CPU, built by GitHub (.github/workflows/linux.yml,
+# artifacts airlynx-linux-x86_64 and airlynx-linux-aarch64) or from a Mac with Docker running:
+./scripts/build-linux-docker.sh             # -> target/linux-docker/airlynx-linux-aarch64.tar.gz (native here; pass linux/amd64 for x86_64, emulated)
+./scripts/bundle-linux.sh                   # on Linux itself: -> target/linux/airlynx-linux-<arch>.tar.gz
+# On the target: tar xzf airlynx-linux-<arch>.tar.gz && cd airlynx-linux-<arch> && ./install.sh
+# It installs into ~/.local (programs, hicolor icons, airlynx.desktop), so AirLynx shows up in the menu under Internet with its icon;
+# "./install.sh --uninstall" removes it. Binaries are built on Ubuntu 22.04, so they need glibc 2.35 or newer, and the app needs
+# libxkbcommon and OpenGL (sudo apt install libxkbcommon0 libgl1). Only the aarch64 bundle has been built and run (headless, see Toolchain).
+
+# Termux (the CLI as a plain Android executable, no APK): cross-compiled with the NDK, API 24+
+./scripts/build-termux.sh                   # -> target/release/termux/airlynx-termux-aarch64.tar.gz and ...-armv7.tar.gz
+./scripts/build-termux.sh --push            # also adb push the aarch64 tarball to /sdcard/Download
+# In Termux (run termux-setup-storage once), unpack and run the bundled installer (scripts/termux-install.sh):
+#   tar xzf /sdcard/Download/airlynx-termux-aarch64.tar.gz -C ~ && ~/airlynx-termux-aarch64/install.sh
+# It puts airlynx in $PREFIX/bin and prepares ~/storage/downloads/AirLynx; "install.sh --uninstall" removes it.
+# Or build it inside Termux: pkg install rust && cargo install --path cli (slow, but needs no NDK)
+
+# CLI (same profile as the desktop app unless --config-dir is given)
+cargo run --release -p airlynx -- receive --dir ./received
+cargo run --release -p airlynx -- discover                  # lists id, address, favorite / has-you-as-favorite
+cargo run --release -p airlynx -- favorite add "Pixel"      # by name or id prefix; a full id works offline
+cargo run --release -p airlynx -- favorite list | remove <name>
+cargo run --release -p airlynx -- favorite info [name]      # address, port, route, has-you-as-favorite, first/last seen
+cargo run --release -p airlynx -- send a.jpg b.pdf --device Pixel   # or --to 192.168.1.20[:port]
+cargo run --release -p airlynx -- browse [path] --device Pixel      # list a favorite's save folder (read only)
+cargo run --release -p airlynx -- get docs/a.pdf --device Pixel -o .  # download a file from it
+```
+
+**Pairing in the app:** open AirLynx on both devices. On the **Send** tab, under **Add a device**, tap **Add** next to the other
+device, and do the same on the other device. The favorite then shows **Online**, and **Send** is enabled once
+files are chosen. Files the receiver confirms (hash verified) are removed from
+the list after a send. Files that failed verification, or a cancelled or failed send, stay in the list. If a device that is not a favorite tries to send, the receiver shows a request on the
+**Received** tab with an **Add favorite** button, which also works when discovery cannot find the device.
+
+On Android, tap **Grant file access** and enable "All files access". The built-in
+file browser needs it, and received files then go to `Download/AirLynx`.
+Without it, received files go to `Android/data/dev.airlynx.app/files/received`.
+
+---
+
+## Repository layout
+
+Cargo workspace (edition 2024, resolver 3):
+
+| Path | Crate | Purpose |
+|------|-------|---------|
+| `core/src/protocol.rs` | `airlynx-core` | Constants (ports, magic, status codes), big-endian read helpers, handshake hello, `human_size` |
+| `core/src/identity.rs` | | `DeviceId`, `Identity`, `Favorites` (shared, persisted, reloads when the file changes on disk, plus the `addresses` cache: last IP per favorite, and the `seen` file behind `sighting()`), `Favorite::details` (the label/value rows of a details view, shared by the app and the CLI), `Profile` (id + favorites in one directory) |
+| `core/src/discovery.rs` | | `scan()` / `discover_with()` / `discover()` ask the network and collect `Peer`s (never including the caller): broadcast per interface, unicast to cached addresses and to mDNS finds. Responder thread used by the receiver |
+| `core/src/mdns.rs` | | `_airlynx._tcp` registration while receiving, and one browser thread per process that remembers the addresses it hears about (best effort, off if the daemon cannot start) |
+| `core/src/secure.rs` | | `Ephemeral` X25519 key exchange and `SecureStream`, an encrypted `Read + Write` wrapper (ChaCha20-Poly1305 records) |
+| `core/src/reverse.rs` | | Reverse connections: the standby registry on the asking side (`standby_peers`, `request`) and the dialer thread on the phone side (`spawn_dialer`), see the protocol section |
+| `core/src/send.rs` | | `prepare()` validates paths, `send_files()` streams them with a progress callback (`ControlFlow::Break` cancels), `resolve()` parses `host[:port]`, `open_session()` is the connect, handshake and hello shared by every command |
+| `core/src/browse.rs` | | Browsing a favorite's save folder: `list()` and `download()` for the asking side, `serve_list`/`serve_get` and the path checks for the owning side |
+| `core/src/receive.rs` | | `start()` returns a `ReceiverHandle` (stops on `stop()`/drop) and emits `ReceiveEvent`s; refuses non-favorites; filename sanitizing and `name (1).ext` dedup |
+| `core/src/stats.rs` | | Wakeup counters for the accept and discovery loops, discovery replies and sessions, plus process CPU time and thread count read from `/proc` |
+| `cli/src/main.rs` | `airlynx` | clap CLI: `send`, `receive`, `discover`, `favorite` |
+| `app/src/app.rs` | `airlynx-app` | The egui UI shared by desktop and Android: three pages, Send (files, favorites, add a device), Received (incoming transfers, requests, history) and Settings (this device, save folder, favorites). Windows 720 px or wider get a sidebar and two columns, narrower ones a bottom tab bar |
+| `app/src/theme.rs` | | Light and dark palettes (follows the system setting), cards, buttons, status pill, progress bar and the painted icons |
+| `app/src/platform.rs` | | Platform facade: desktop impl inline (rfd dialogs, `dirs`, `open`), Android re-exports `android.rs` |
+| `app/src/android.rs` | | JNI glue: device model, files shared from other apps, config dir, all-files-access check/request, multicast lock, status bar and navigation bar height, dark mode |
+| `app/src/browser.rs` | | In-app file browser (Android only) |
+| `app/src/remote.rs` | | The remote folder view opened by the folder button on a device card: folders, sizes, a **Get** button per file |
+| `third_party/eframe/` | | eframe 0.37.0 with one marked change in `src/native/glow_integration.rs`, wired in by `[patch.crates-io]` in the root `Cargo.toml` (see the gotcha about quitting at startup on a TV). Drop it when upstream fixes this |
+| `app/src/diag.rs` | | Battery and wakeup diagnostics (Android only): the Settings > Diagnostics card and the optional once-a-minute logcat line |
+| `app/src/lib.rs` | | Module wiring and `android_main` entry point |
+| `app/src/main.rs` | | Desktop entry point |
+| `app/java/dev/airlynx/app/MainActivity.java` | | NativeActivity subclass that is the Share target: copies shared content URIs (and shared text) into the cache, and hands the paths to Rust over JNI |
+| `app/java/dev/airlynx/app/ReceivedFilesProvider.java` | | Read-only content provider for the receive folders. **Open** in History hands its content URI to `ACTION_VIEW` (`MainActivity.openFile`), because a file:// URI is refused at targetSdk 34 and androidx's FileProvider is not available without Gradle |
+| `app/java/dev/airlynx/app/ReceiveService.java` | | Foreground service (notification) that keeps the process running while the screen is locked |
+| `app/res/` | | Android launcher icon (adaptive, with monochrome layer), generated by `scripts/make-icons.py` |
+| `assets/fonts/` | | Inter Regular and SemiBold (SIL OFL, license included), embedded by `theme.rs`. egui's default text font is too thin on retina screens |
+| `assets/icon/` | | Icon master (`airlynx.svg`), 512 px PNG (desktop window icon), `AirLynx.icns` (macOS bundle), `airlynx-logo.png` (192 px, cropped to the icon edge, shown in the app header) |
+| `scripts/make-icons.py` | | Draws the icon and renders every size (needs `rsvg-convert`, `iconutil`); outputs are committed |
+| `scripts/build-apk.sh` | | Sets SDK/NDK env, creates the debug keystore if missing, runs `cargo apk build --release --lib`, then adds the Java service (see gotchas) |
+| `scripts/build-termux.sh` | | Cross-compiles the `airlynx` CLI for `aarch64-linux-android` and `armv7-linux-androideabi` with the NDK clang at API 24 (Termux's minimum), one tarball per CPU with `install.sh` and `README.txt` |
+| `scripts/termux-install.sh` | | Becomes `install.sh` in the Termux tarball (POSIX sh): checks the binary runs, installs into `$PREFIX/bin`, prepares the save folder, prints next steps, `--uninstall` |
+| `scripts/bundle-linux.sh` | | Builds the Linux tarball: desktop app, CLI, `assets/airlynx.desktop`, `assets/hicolor` icons, `install.sh` (from `scripts/linux-install.sh`) and `README.txt`; takes an optional Rust target for cross builds |
+| `scripts/build-linux-docker.sh` | | Runs `bundle-linux.sh` in an Ubuntu 22.04 container, for building from a Mac |
+| `scripts/bundle-macos.sh` | | Builds `AirLynx.app` with Info.plist (incl. `NSLocalNetworkUsageDescription`), ad-hoc signs it |
+
+### Threading model (app)
+
+All networking runs on background threads. They write into `Arc<Mutex<Shared>>` and call
+`ctx.request_repaint()`. The UI clones `Shared` each frame and records what the user did in an `Actions`
+value that is applied after drawing. One thread runs per scan, per send, and per incoming connection. The
+receiver also has an accept thread and a discovery responder thread. Both block until something arrives
+instead of polling (each wakeup costs a phone battery), so stopping the receiver sends each of them something over
+loopback. The app rescans every 6 s while its window has focus and shows the Send or Settings page, and every 60 s
+otherwise, since every scan wakes the devices that answer. A device stays "online" for 20 s after its last answer.
+
+Identity and favorites are stored in `<config dir>/AirLynx` on desktop (`~/Library/Application Support/AirLynx`
+on macOS) and in the app's private `files/config` on Android, as `device-id`, `favorites` and (optional) `device-name` text files.
+`device-name` holds the name the user chose under Settings > This device > **Rename**; without it the platform's own name is used
+(hostname on desktop, the model on Android). The CLI reads it too, and `receive --name` still overrides it. Saving restarts the receiver so the
+new name is announced, and favorites pick it up on their next scan.
+A `favorites` line is `<id> kind:<desktop|mobile|macsplorer|tv|unknown> <name>`; older lines without `kind:` still load.
+`addresses` holds `<id> <ip>`. `seen` holds what the favorite details show besides the address, one line per favorite:
+`<id> <first> <last> <port|-> <mutual 0|1|-> <local ip|-> <interface|->` (Unix seconds, interface last because its name can
+hold spaces). A scan or an incoming session from a favorite updates it; a change of only the last-seen time is written at most once a minute,
+so the every-6-seconds scan does not write to flash. A favorite that only has an address (from before `seen` existed) shows its times as unknown.
+
+**Favorite details:** Settings > Favorites > **Info** (and `airlynx favorite info`) lists the short and full id, kind, status (app only),
+address, port, route, protocol, whether it has faved this device ("Faved you"), and first and last seen. The route is the local interface that
+shares a subnet with the favorite's address (`discovery::route_to`), or "through the gateway" if none does. The protocol row is the version this build
+speaks (`VERSION`); discovery does not carry the peer's own version. Times are relative ("3 days ago") because the UI has no local-time formatting.
+
+---
+
+## Protocol (version 6)
+
+**Discovery** on UDP 47801. A device sends `AIRLYNX_DISCOVER <id>` (its 32-hex-digit device id) twice, three ways at once, because
+no single one works on every network:
+
+1. **Broadcast per interface.** To `255.255.255.255` on the default route, and from a socket bound to each IPv4
+   interface to that subnet's own broadcast address (`ip | !netmask`, so a /16 reaches all of its /24 ranges). A phone on
+   Wi-Fi plus a hotspot, or a Mac with a VPN, is asked on every network.
+2. **Last known address.** Unicast to the IP each favorite last answered from (or last connected from). It is stored in the
+   `addresses` file next to `favorites`, and is only ever a hint: a stale address just gets no answer.
+3. **mDNS.** A receiving device registers `_airlynx._tcp.local.` (instance name = device id, TXT `id`, `kind`, `name`).
+   Every scan also unicasts the question to each address the mDNS browser has found. mDNS can't carry `mutual`, which differs
+   per asker, so it only supplies addresses and the UDP exchange below still decides who is a peer. This helps on networks
+   that pass multicast but drop broadcast.
+
+The question and the answer keep their format (the answer only gained one more `kind` letter, which older builds ignore, and the TCP protocol did not change, so `VERSION` stays 4).
+Every other running device replies
+`AIRLYNX_HERE <tcp_port> <id> <mutual 0|1> <kind d|m|x|t|?> <name>` to the asker's address. `kind` is `d` for a
+computer, `m` for a mobile device, `x` for a computer running Macsplorer (shown with a monitor-and-folder icon), `t` for an Android TV (a TV icon), `?` if unknown (shown as an icon next to favorites).
+Builds from before `x` or `t` existed read them as `?`, so nothing breaks. `mutual` is 1 when the replier has
+the asker as a favorite. The asker drops replies carrying its own id and de-duplicates by id, so a device that answers on several interfaces or
+through several of the ways above is listed once.
+
+**Transfer** on TCP 47800 (default). There is one connection per send session, and all integers are big-endian:
+
+```
+sender                                       receiver
+"ALNX" | version u8 | public key [u8;32] ->
+                                       <-    status u8   (0 ok, 2 rejected: version mismatch, ends the session)
+                                       <-    public key [u8;32]   (only after status 0)
+==== everything below is inside the encrypted stream ====
+sender id [u8;16] | name_len u8 | name | command u8 ->
+                                       <-    status u8   (0 ok, 2 unknown command, 3 sender is not a favorite,
+                                                           4 receiver cannot write to its save folder (SEND only))
+
+command 1, SEND:
+file count u32                         ->
+per file:
+  name_len u16 | name (UTF-8) | size u64 | data | sha256[32]  ->
+                                       <-    status u8   (0 ok, 1 hash mismatch)
+
+command 2, LIST (browse the receiver's save folder):
+path_len u16 | path (UTF-8)            ->
+                                       <-    status u8   (0 ok, 5 not found, 6 read error)
+                                       <-    entry count u32, per entry: kind u8 (0 file, 1 folder) | name_len u16 | name | size u64 | modified u64
+
+command 3, GET (download one file from it):
+path_len u16 | path (UTF-8)            ->
+                                       <-    status u8   (0 ok, 5 not found, 6 read error)
+                                       <-    size u64 | data | sha256[32]
+```
+
+A session carries exactly one command. LIST and GET are why a device that has added you as a favorite can read its save folder
+("browse both ways" is just every device being both ends: each one answers and each one can ask). They are read only, and the
+path is "/" separated and relative to the save folder (empty for the folder itself). The owner answers `not found` for anything it
+will not show: `..`, names starting with a dot (which covers the `.part` files of transfers in progress), and anything whose real
+location (symlinks followed) is outside the folder. Listings skip hidden entries and symlinks, put folders first and are cut off at
+20,000 entries. A downloaded file is hash-checked and saved to the asker's own save folder as `name (1).ext` if the name is taken.
+Unlike SEND, they do not need the save folder to be writable. The app does not ask the owner for permission, same as a send from a
+favorite, so anyone who can pass as a favorite (see the trust model) can read everything in the folder.
+
+**Encryption:** both sides make a throwaway X25519 key pair per session and swap public keys in the handshake.
+Each direction gets its own ChaCha20-Poly1305 key, `SHA-256("airlynx v6 " | label | shared secret | sender pub | receiver pub)`.
+After the handshake the stream is a series of records, `len u16 | ciphertext+tag`, with up to 16 KiB of plaintext each.
+The nonce is a per-direction record counter, so records can't be reordered, replayed or dropped unnoticed.
+Writes are buffered and flushed when a record fills, on `flush`, and before every read.
+This keeps file names, contents and device names out of packet captures and router logs. UDP discovery is **not**
+encrypted (it carries the device id, kind and name).
+
+The receiver writes each file to a hidden `.<name>.<pid>.<n>.part` file and renames it only
+after the hash matches. Names are reduced to their last path component, so they can't escape
+the target directory.
+
+Status 4 was added in version 4 without bumping `VERSION`: it replaces the OK after the hello, so an older sender that does not know it
+stops with "receiver rejected the handshake" instead of a clear message, and nothing else changes. The receiver checks
+before every session (after the favorite check, so strangers learn nothing about its storage) that the save folder exists
+and a file can be created in it, so a folder that became unwritable while the app ran refuses the session before any file
+data is sent, and shows a "Transfer refused" entry in History.
+
+The command byte after the hello is what made this version 5, and the reverse connection commands below (4 and 5) made it version 6.
+Changing the wire format means bumping `VERSION` in `core/src/protocol.rs`.
+
+**Reverse connection** (`core/src/reverse.rs`), for a device that can reach us but that we cannot reach back, for example a phone on a
+WireGuard VPN whose server masquerades its traffic: the Mac sees the phone only as the VPN host's address, so broadcast, mDNS and the
+cached address all fail in that direction. The phone (the dialer, `ReceiverConfig::reverse`, on by default on Android and `receive --reverse`
+in the CLI) keeps a standby connection open to every favorite whose address it has seen:
+
+```
+phone                                        computer
+(handshake as above, phone is the TCP client)
+phone id | name | command 4, STANDBY   ->
+                                       <-    status u8   (0 ok, 3 not a favorite)
+                                       <-    ping 0, answered by pong 0 from the phone, every 60 s
+                                             (the phone gives up after 180 s of silence)
+                                       <-    want 1 | token [u8;16], when the computer wants a session
+
+(on a want, the phone opens a second connection, handshake as above)
+phone id | name | command 5, ATTACH | token [u8;16]  ->
+                                       <-    status u8   (0 ok, 2 no session is waiting for that token)
+==== from here the computer asks and the phone answers, over this connection ====
+                                       <-    computer id | name | command 1, 2 or 3 (as above)
+status u8, then the command goes on as above  ->
+```
+
+The standby connection also lists the phone in `scan()`, as a `Peer` whose address is where the connection came from (the VPN host and an
+ephemeral port, which says nothing about how to reach it, so it is not remembered). `send::open_session` looks that address up and asks
+for a connection instead of dialing, so `send_files`, `browse::list` and `browse::download` need no change. A device found the normal
+way is preferred over its standby entry. The computer accepts standby and attach from favorites only (a stranger gets the usual
+"not a favorite" request on the Received tab), and a token is good once, for ten seconds. A phone that loses the standby connection
+dials again after 10 s, and after 60 s if the computer did not answer. The trust model is unchanged: whoever passes as a favorite can
+register as the phone, and the computer would then send to it.
+
+**Trust model:** the sender id is a plain identifier, not a secret. It is broadcast on the LAN, so a host that
+has seen it can claim to be that device. Favorites keep strangers and mistakes out, but they are not
+authentication. The key exchange is likewise unauthenticated: it stops anyone who only records traffic, but a host that
+actively sits in the middle of a connection could still read it. See "Security" under next steps.
+
+---
+
+## UI design
+
+The app is one egui UI for desktop and Android (`app/src/app.rs`, styling in `app/src/theme.rs`).
+
+- **Pages:** **Send** (files, favorites as device cards, Add a device), **Received** (incoming transfers, requests
+  from non-favorites, history), **Settings** (this device, save folder, file access, favorites with Remove).
+  Window width picks the layout: 720 px or more gets a left sidebar and two columns on Send, anything narrower
+  (all phones) gets a header and a bottom tab bar. The Android file browser replaces the page and hides the tab bar.
+- **Browsing a favorite:** an online favorite that has added this device shows a folder button next to Send. It opens that
+  device's save folder in place of the pages (tabs hidden, like the Android file picker): tap a folder to open it, **Up** to go back,
+  **Get** to download a file into this device's save folder. One download at a time. Not cancellable yet.
+- **Received history (desktop):** each received file has an **Open** button. A left click on its icon copies the file's full absolute path to the
+  system clipboard (`ctx.copy_text`) and the row says "Path copied to the clipboard". A right click on the icon or the name opens a menu with
+  **Copy path** and **Open**. Android has only Open.
+- **Flow:** choose files, then press **Send** on an online, mutual favorite. While sending, that card shows the
+  progress bar, byte counts and **Cancel**, and the other Send buttons are disabled. The result is a dismissible
+  banner at the top of Send. The Received tab badge counts unseen files plus pending requests.
+- **Theme:** `theme::LIGHT` and `theme::DARK` palettes, picked by `theme::pal(ui)` from egui's dark mode. Colors come from
+  the app icon (indigo accent, navy text) plus green, amber and red for status. All widgets are painted in
+  `theme.rs` (`card`, `button`, `icon_button`, `tile`, `pill`, `progress`, `logo`) and the icons are drawn with
+  shapes on a 24 by 24 grid (`theme::Icon`), so no icon font or images are needed. Controls are 44 pt high on
+  Android and 38 pt on desktop.
+- **Fonts:** Inter Regular and SemiBold from `assets/fonts/` replace egui's thin default text font. Headings, names
+  and button labels use the `theme::bold()` family. The mockups the design came from were made on a Claude Design canvas
+  and are not in the repo.
+- **Android TV:** the same APK runs on a TV (`LEANBACK_LAUNCHER` filter and a banner in the manifest, touchscreen, leanback and portrait
+  declared optional). `android::is_tv()` (UI mode TELEVISION) reports itself as kind `t` (TV icon) and fits the zoom on the first frame so the layout is 540 points tall (`AirLynxApp::fit_tv_zoom`; 1.0 on the 1080p, 320 dpi test TV), and `MainActivity` switches it to landscape. The remote's
+  D-pad arrives as arrow keys and Enter, which egui turns into focus moves and clicks. egui only moves focus from a widget that already
+  has it, so `AirLynxApp::handle_keys` focuses the first widget on the first arrow press. The custom-painted widgets call `theme::focus_ring`,
+  which draws a ring only after key input (not after a tap) and scrolls the widget into view. Only buttons and checkboxes take focus, so
+  `handle_keys` also scrolls the page by `TV_SCROLL_STEP` when an Up or Down press leaves focus where it was (otherwise the text below the last
+  button on Settings could never be reached; verified on the TV with `adb shell input keyevent KEYCODE_DPAD_DOWN`). Back closes the file browser or the remote
+  folder view, then returns to Send, then sends the app to the background (`moveTaskToBack`, the receiver keeps running). Not tried on a
+  real TV yet, only the D-pad and Back keys on the phone emulator (`adb shell input keyevent KEYCODE_DPAD_DOWN`, `KEYCODE_BACK`).
+  There are two APKs, arm64 and armv7, because many TVs (the Philips PUS8545 is believed to be one) have a 32-bit userland;
+  the armv7 one runs on a real Philips TV (TPM191E, Android 12, 32-bit cortex-a9, MediaTek): UI up, "Ready to receive", adb over the network
+  (`adb connect <tv-ip>:5555`). Sending, receiving and the D-pad have not been tried on it yet. Most TVs have no
+  screen for All files access, so grant it with `adb shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow`.
+- **Dark mode on Android** is read over JNI (see the gotchas). On desktop egui follows the system setting.
+
+---
+
+## Toolchain and environment
+
+- Rust 1.95+, targets `aarch64-linux-android` and `armv7-linux-androideabi`
+- Android SDK at `~/Library/Android/sdk` (platform 34, build-tools 36, NDK 27.3), `cargo-apk` 0.10
+- The scripts default `ANDROID_HOME` to the path above and pick the newest NDK unless `ANDROID_NDK_ROOT` is set
+- The Termux build is the CLI only (the app needs the APK's NativeActivity). It was run on the arm64 emulator in `adb shell`, which has
+  the same bionic userland as Termux: mutual favorites, broadcast discovery over the real interfaces, and an encrypted send all worked,
+  and so did `install.sh` (install, uninstall, wrong-CPU bundle, no shared storage) with `PREFIX` and `HOME` pointed at scratch folders.
+  Not run inside Termux itself or on 32-bit Android (the armv7 binary is only built). In Termux the hostname is `localhost`, so pass `--name`.
+- The Linux bundle (aarch64) was built in Docker and its `install.sh` run in a clean Ubuntu 22.04 container: files land in `~/.local`,
+  `desktop-file-validate` passes, `--uninstall` removes everything, and the app started under Xvfb with window class `airlynx` (the
+  `with_app_id` in `app/src/main.rs`, which matches `StartupWMClass`). It was not looked at on a real Xfce desktop, so the panel icon
+  is unconfirmed. The x86_64 bundle was not built.
+- Key versions: `eframe`/`egui` 0.37 (glow backend), `winit` 0.30.13, `jni` 0.21, `rfd` 0.17
+- Android package id `dev.airlynx.app`, minSdk 30, targetSdk 34
+
+## Testing
+
+```sh
+cargo test --workspace
+cargo clippy --workspace            # kept warning-free
+```
+
+**Android emulator** (AVD `Pixel_3a_API_34_extension_level_7_arm64-v8a`):
+
+```sh
+SDK=~/Library/Android/sdk; ADB=$SDK/platform-tools/adb
+$SDK/emulator/emulator -avd Pixel_3a_API_34_extension_level_7_arm64-v8a -no-window -no-audio -gpu swiftshader_indirect &
+./scripts/build-apk.sh --install
+$ADB shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow   # skip the settings screen
+$ADB shell am start -n dev.airlynx.app/.MainActivity
+$ADB exec-out screencap -p > shot.png                                # look at the UI
+$ADB shell input tap X Y                                             # drive it (physical px, 1080x2220)
+$ADB shell cmd uimode night yes                                      # dark mode (no = light)
+$ADB logcat | grep -i airlynx
+```
+
+**Measuring battery use while listening (physical phone):** Settings > Diagnostics shows drain, current, screen and Doze
+state, whether the locks are held, process CPU time and how often the loops wake up, all counted since a baseline
+("Reset baseline"). The screen being on inflates the numbers, so for a real test:
+
+1. Unplug the phone (while charging the drain is not measured), open Settings and tick **Write a log file**.
+   That also resets the baseline and appends a header line to `airlynx-diag.log` in the save folder
+   (`Download/AirLynx` with file access).
+2. Lock the phone and leave it for an hour or more.
+3. Get the file off the device without adb: on the Send tab, **Browse files**, pick `airlynx-diag.log` and send it to a
+   favorite (the Mac saves it in `~/Downloads/AirLynx`). With adb it is `adb pull /sdcard/Download/AirLynx/airlynx-diag.log`.
+   Each line is also logged to logcat (`adb logcat -d | grep airlynx_app::diag`).
+
+Each line is self-contained. `ts` is the Unix time, and `start_uah - uah` over `ts` gives the drain in
+microampere-hours (`start_pct` and `pct` are the coarse version). Work out rates from `ts` or `wall_s`, which keep
+running while the phone sleeps. `awake_s` is the time the process could run, so `awake_s / wall_s` is how much of the time
+the phone was awake. `cpu_s` is CPU time since the baseline, and `accept_polls` / `discovery_polls` count loop
+wakeups, which since the loops block are connections and packets that arrived. `uah` is `-` on devices that do not report it, and `current_raw` is in a device-specific unit and
+sign (this Galaxy reports milliamperes), so trust the charge counter. `event` says why the line was written: `start`,
+`tick` (a minute of real time passed), `screen` (the screen turned on or off) or `exp` (a switch changed). Without the
+wake lock (held only during a session now) the CPU sleeps for minutes at a time and lines only appear when it wakes, so use the `screen` lines as the
+start and end of each screen-off stretch. Runs are appended, and a `#` header line starts each one.
+
+The log also explains why it stopped. Each run starts with `# earlier exit` lines from Android's own record of how
+earlier processes of the app ended (`reason=signaled status=9 importance=cached` means it was killed while cached,
+`importance=foreground-service` means the service did not protect it, `freezer`, `low-memory` and `user-requested` are
+what they say). The same list is on the Diagnostics card. A `# app closed` line means the activity was destroyed
+(the receiver lives in it, so it stops too; winit ignores Android's destroy event, so a watcher thread notices
+`Activity.isDestroyed()` and exits the process, otherwise `onDestroy` blocks the main thread into an ANR), and a `# panic` line gives the message of a crashed thread. A log
+that just ends with none of these, and no new exit entry afterwards, means the process was gone without Android
+recording anything, which would be unusual.
+
+For a hang (`reason=anr`) or a native crash, Android also keeps the stack traces it took. On start the app saves them next to
+the log as `airlynx-trace-<unix seconds>.txt` (`.pb` for a native crash), once per exit, and the exit line says
+`trace=<file>`. Send that file off the device like the log: it shows what every thread was doing, so a spinning thread
+and a blocked one look different, and the frames in `libairlynx_app.so` point at the code.
+
+**Finding out which part costs battery:** the card has an Experiments section with four switches: receiver on (off is
+the control run: no service, no locks, no threads), CPU wake lock and Wi-Fi lock (both taken only while a session
+runs), and multicast lock (held the whole time). Each change restarts the receiver and the baseline, and every log line
+records the combination as `exp=rx:1,wake:1,wifi:1,mcast:1` along with the locks actually held. Logs from before
+the wake and Wi-Fi locks became per-session end the label with `,poll:100` and show `locks=wake+wifi+multicast` while idle;
+a first comparison (Galaxy S23, screen off) measured about 200 mA with all three held all the time against about 160 mA
+with none. The switches are not saved, so a
+restart goes back to everything on. A suggested sequence, with the phone unplugged and about 30 minutes per step
+(the charge counter moves in 3.7 mAh steps, so shorter runs are too coarse; the other phone activity is large, so
+differences under about 20 mAh/h will not show up):
+
+1. Receiver off (control), then everything on, 40 minutes or more each. Then try the multicast lock the same way. Finish with the control again to see whether the drain drifted.
+2. Wake the phone only to flip a switch, then lock it again and leave it alone. Compare the drain between a `screen`
+   line that turned the screen off and the next `screen` line that turned it on.
+3. Send the file back and subtract each step's drain from the one before. The switches can make discovery or the
+   first transfer slower, so also check that a send from the Mac still works in each state.
+
+For a baseline to compare against, run the same hour with the receiver stopped (close the app) and subtract. On the
+emulator the battery numbers are fake (it reports 100% and 900 mA) but the CPU and wakeup counters are real.
+
+- **Share target:** `adb shell "am start -a android.intent.action.SEND -t image/png --eu android.intent.extra.STREAM content://media/external/images/media/<id> --grant-read-uri-permission -n dev.airlynx.app/.MainActivity"`
+  (find `<id>` with `adb shell content query --uri content://media/external/images/media`; quote the whole remote command, or
+  `adb` splits arguments at spaces). Text: `-t text/plain --es android.intent.extra.TEXT 'hello'`. `SEND_MULTIPLE` can't be
+  built with `am`, so it has only been read, not run. With `adb root`, `ls /data/data/dev.airlynx.app/cache/share` shows the copies.
+- The mDNS test needs multicast, so it is skipped by default: `cargo test -p airlynx-core -- --ignored`.
+- The emulator sits behind NAT, so broadcast discovery can't reach the Mac. The app has no manual address entry
+  (see the icebox), so test the emulator against the CLI.
+- **Emulator to Mac:** not possible from the app without an address field. The emulator can only be reached from the Mac.
+- **Mac to emulator:** run `adb forward tcp:47900 tcp:47800`, then `airlynx send f --to 127.0.0.1:47900`.
+  The emulator shows a request with **Add favorite**; accept it, then send again.
+- Two profiles on one machine can test favorites with the CLI: `--config-dir a` and `--config-dir b`
+  (only one receiver can bind the ports at a time).
+
+---
+
+## Gotchas learned the hard way
+
+- **The app quit at once on Android TV (and left no log):** `eframe::run_native` returned `Ok` about 50 ms after starting, so
+  `android_main` returned and NativeActivity finished the activity (`wm_finish_activity ... app-request`, process "exited cleanly (0)").
+  eframe's `WinitApp::window_event` answers `EventResult::Exit` when it gets a window event before the first `resumed` has created the
+  window, and on the TV winit delivers one first (focus or a configuration change; phones deliver `InitWindow` first). The patched copy in
+  `third_party/eframe` ignores such an event instead. To debug something like it: nothing is logged below `Error` unless `with_max_level` in
+  `app/src/lib.rs` is raised, and an `Ok` return from `run_native` is silent, so log around it.
+- **egui 0.37 API changed:** `eframe::App` now has `fn ui(&mut self, ui: &mut egui::Ui, frame)`, not `update`.
+  Panels are `egui::Panel::top("id").show(ui, …)` and `egui::CentralPanel::default_margins().show(ui, …)`.
+  `DroppedFile` is a trait, so use `f.path()`.
+- **eframe does not re-export winit.** `winit` is a direct Android-only dependency and must stay on the
+  same version eframe uses (0.30.x). `AndroidApp` comes from `winit::platform::android::activity`.
+- **`jni` is pinned to 0.21.** 0.22 rewrote the API.
+- **Always run `cargo apk build --lib`.** Without `--lib`, cargo-apk panics with "Bin is not compatible with Cdylib"
+  because of the desktop `[[bin]]` target.
+- **NativeActivity draws under the status bar.** The header adds `status_bar_height_px()` (JNI, cached).
+  It draws under the gesture/navigation bar too, so the tab bar adds `navigation_bar_height_px()` (window insets via JNI) and the file
+  browser adds it as bottom margin. Keep targetSdk at 34, because 35 forces edge-to-edge.
+- **Android dark mode:** winit does not report it, so `android::is_dark_mode()` reads `Configuration.uiMode` and `tick` applies it
+  every 2 s. Test with `adb shell cmd uimode night yes|no`.
+- **egui rows:** `ui.horizontal` reads `interact_size.y` before its closure runs. To make a short row, set it on a `ui.scope`
+  around the row (`theme::row`), not inside the closure.
+- **egui's default fonts lack many symbols** (📁 ✖ ⬆ ✔ render as empty boxes). Stick to ASCII in UI strings (`…` is fine).
+- **Accepted sockets inherit non-blocking mode** from the listener on macOS. `handle_session` resets it.
+- **The Android soft keyboard** appears through winit's `set_ime_allowed`, and typing works. The window does not
+  resize, though, so the keyboard covers anything below the focused field.
+- **JNI calls** go through `android::with_env`, which attaches the thread and logs and clears Java exceptions.
+  The `AndroidApp` is stored in a `OnceLock` by `android::init`.
+- **Receiving with the screen locked:** `android::set_keep_awake` starts `ReceiveService` (a `dataSync` foreground
+  service with an ongoing notification) and holds a multicast lock while the receiver runs. A partial wake lock and a Wi-Fi lock
+  are held only while a session runs, in either direction: `airlynx_core::busy` counts sessions (receiving, serving a listing or
+  download, a dial-back, sending, browsing) and calls `android::set_busy` when the first starts and the last ends. In between,
+  the phone sleeps and an incoming connection wakes it (`android::set_keep` picks which locks, for the Diagnostics experiments).
+  cargo-apk 0.10 can neither ship Java nor declare a `<service>` or `<provider>`, so `build-apk.sh` compiles `app/java` with
+  `javac` + `d8`, patches the generated manifest (`hasCode`, `<service>`, `<provider>`) and reassembles the APK with `aapt`,
+  `zipalign` and `apksigner`. The service is addressed by name over JNI (a native thread's class loader can't see
+  app classes). Android 13+ needs the `POST_NOTIFICATIONS` permission, which the app requests at start; without it the
+  service still runs but the notification is hidden. The service stops when the app exits. Verified on the API 34
+  emulator with the screen asleep; not on a physical phone yet. Android 15 limits `dataSync` services to 6 h
+  per day once targetSdk is 35.
+- **cargo-apk drops its launcher filter** as soon as `Cargo.toml` declares any `MAIN` intent filter. `app/Cargo.toml` therefore lists
+  `LAUNCHER` and `LEANBACK_LAUNCHER` together in one filter. Without it the app has no launcher icon, and `ReceiveService` crashes
+  because `getLaunchIntentForPackage` returns null. `aapt` also adds `android.hardware.screen.portrait` as required because of the portrait
+  lock, which makes a TV refuse the install, so it is declared `required = false`.
+- **Share target (`MainActivity`):** cargo-apk can set the activity class and launch mode (`name`, `launch_mode` in `app/Cargo.toml`)
+  and add intent filters (`SEND`, `SEND_MULTIPLE`, `*/*`), so the manifest needs no patch for it. It must be `singleTask`:
+  a share while the app runs then arrives in `onNewIntent`, instead of starting a second NativeActivity (and a second
+  native thread). Shared content URIs are copied into `cache/share/<batch>/<name>` on a Java thread (`/proc/self/fd`
+  paths are denied under scoped storage, and a share can be gigabytes), plain text becomes `<subject>.txt`. Rust polls
+  `takeSharedFiles` / `sharedPreparing` / `takeShareError` from `tick` and calls the methods on the activity object directly,
+  since a native thread's class loader can't find app classes. Copies are deleted when sent, removed or cleared, and the
+  whole folder at startup. The shared list is in memory only. Not verified on a physical phone.
+- **Opening received files (Android):** `ReceivedFilesProvider` (authority `dev.airlynx.app.files`, not exported, grants read
+  access per URI) only serves regular files inside `Download/AirLynx` and the app's `received` folders, never `config/`. The
+  URI path is the absolute file path, so the other app sees the real name. Verified on the API 34 emulator (a received
+  `.txt` opens the system "Open with" chooser); the not-writable refusal is covered by a core test, not run on a device.
+- **mDNS on Android** needs the multicast lock (already held while receiving) and runs two threads (`mDNS_daemon`,
+  `airlynx-mdns`) that sleep when idle. The daemon is IPv4 only.
+- **Edition 2024** requires `#[unsafe(no_mangle)]` on `android_main`.
+
+---
+
+## Known limitations / next steps
+
+Rough priority order:
+
+0. **Reverse connection (prototype).** Covered by a core test (`reverse::tests`: a fake phone dials a fake computer, which then
+   lists, downloads and sends over the connection the phone opened). Not yet run with a real phone behind a NAT. Open points: the
+   phone wakes every 60 s for the ping while the app runs (was 15 s; a Mac on the old interval still works with a new phone,
+   but a new Mac pings an old phone too rarely and its standby connection drops every 45 s), only the process that runs the receiver sees standby devices (a separate `airlynx send` process does not), the
+   dialer tries every favorite it knows an address for, including ones it could reach directly, and a Mac to Mac pair would work too
+   (`receive --reverse`).
+1. **Test on a real phone and Mac on the same Wi-Fi**, especially discovery. Per-interface broadcast, the address cache
+   and mDNS are done and tested on one Mac (two CLI profiles) and the emulator, but only the CLI run exercised all three
+   against a real peer. Still untested: a network that really drops broadcast, a phone on a hotspot, and macOS asking for
+   the Local Network permission for mDNS.
+2. **Android share target:** done (see the gotchas), including text. Open: a one-tap "send to the only online favorite"
+   after a share, `SEND_MULTIPLE` on a real device, and moving from all-files access to the Storage Access Framework,
+   which Play Store review prefers.
+3. **Security:** transfers are encrypted (v4 and later) but not authenticated, and favorites are matched by an unauthenticated
+   device id (see the trust model above), so a host on the LAN that learns a favorite's id can impersonate it, and an
+   active man in the middle can read a session. Fix: a pairing step that exchanges a secret or public key when two
+   devices favorite each other (for example a short code shown on both screens), then use it to authenticate the
+   key exchange. Discovery packets are still plaintext.
+4. **Receiver UX:** a cancel button for incoming transfers, persisted history (it is in memory only, and ages
+   show as "5 min ago" because no wall-clock time is kept), and a notification when a file arrives.
+5. **UI follow-ups:** look at the desktop layout on a real screen and fix what is off, per-type file icons (every file
+   uses the same tile), a gradient on the logo and progress bar (only the icon PNG has one), and an Unfavorite shortcut
+   on the device card (it now lives only in Settings).
+6. **Packaging:** a release keystore, an x86_64 Android target, and a universal macOS binary.
+7. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
+   and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
+8. **Browsing follow-ups:** an owner-side switch to turn sharing of the save folder off (now every favorite that has added you can read it),
+   cancelling a download, downloading a whole folder, and showing downloads in History. Not run on a device or looked at on a real screen yet.
+9. **Finder Network entry (SMB gateway):** each online favorite as a read-only SMB share under Network in Finder. Spiked, not built:
+   Finder mounted a reference SMB2 server through a Bonjour `_smb._tcp` entry on a custom port with Guest login. See `SMB-GATEWAY.md` for
+   what was tested, which Bonjour types Finder lists, the design and the open questions.
+
+### Icebox
+
+- **Send to an address:** a collapsible section in the app with a host/IP field and its own Send button, for devices
+  that discovery cannot find (for example the emulator behind NAT). It resolved the target with `send::resolve` and
+  reused `start_send`. It was removed from the UI, and the CLI still has `send --to`. If it comes back, move Send above
+  the field, because the soft keyboard covers it on Android.

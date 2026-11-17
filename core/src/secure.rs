@@ -7,7 +7,7 @@
 //!
 //! This hides the traffic from anyone who only records it (packet captures, router logs).
 //! It does not authenticate the peer, so someone who can actively sit in the middle of the
-//! connection could still read it. See the trust model in the README.
+//! connection could still read it. See the trust model in docs/DEVELOPING.md.
 
 use std::io::{self, Read, Write};
 
