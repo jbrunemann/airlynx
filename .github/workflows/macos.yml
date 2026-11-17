@@ -1,0 +1,33 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-latest is Apple silicon, so this is an arm64 build (see scripts/bundle-macos.sh).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Builds target/release/AirLynx.app and signs it ad hoc.
+      - name: Bundle
+        run: scripts/bundle-macos.sh
+
+      # ditto keeps the bundle's permissions and signature, which upload-artifact on a plain folder would lose.
+      - name: Zip the app
+        run: ditto -c -k --keepParent target/release/AirLynx.app AirLynx-macos-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlynx-macos-arm64
+          path: AirLynx-macos-arm64.zip

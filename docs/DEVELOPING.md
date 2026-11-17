@@ -103,7 +103,7 @@ Cargo workspace (edition 2024, resolver 3):
 | `assets/fonts/` | | Inter Regular and SemiBold (SIL OFL, license included), embedded by `theme.rs`. egui's default text font is too thin on retina screens |
 | `assets/icon/` | | Icon master (`airlynx.svg`), 512 px PNG (desktop window icon), `AirLynx.icns` (macOS bundle), `airlynx-logo.png` (192 px, cropped to the icon edge, shown in the app header) |
 | `scripts/make-icons.py` | | Draws the icon and renders every size (needs `rsvg-convert`, `iconutil`); outputs are committed |
-| `scripts/build-apk.sh` | | Sets SDK/NDK env, creates the debug keystore if missing, runs `cargo apk build --release --lib`, then adds the Java service (see gotchas) |
+| `scripts/build-apk.sh` | | Sets SDK/NDK env, uses `android-debug.keystore` (decoded from `ANDROID_KEYSTORE_BASE64` in CI, otherwise created if missing), runs `cargo apk build --release --lib`, then adds the Java service (see gotchas) |
 | `scripts/build-termux.sh` | | Cross-compiles the `airlynx` CLI for `aarch64-linux-android` and `armv7-linux-androideabi` with the NDK clang at API 24 (Termux's minimum), one tarball per CPU with `install.sh` and `README.txt` |
 | `scripts/termux-install.sh` | | Becomes `install.sh` in the Termux tarball (POSIX sh): checks the binary runs, installs into `$PREFIX/bin`, prepares the save folder, prints next steps, `--uninstall` |
 | `scripts/bundle-linux.sh` | | Builds the Linux tarball: desktop app, CLI, `assets/airlynx.desktop`, `assets/hicolor` icons, `install.sh` (from `scripts/linux-install.sh`) and `README.txt`; takes an optional Rust target for cross builds |
@@ -497,7 +497,7 @@ Rough priority order:
 5. **UI follow-ups:** look at the desktop layout on a real screen and fix what is off, per-type file icons (every file
    uses the same tile), a gradient on the logo and progress bar (only the icon PNG has one), and an Unfavorite shortcut
    on the device card (it now lives only in Settings).
-6. **Packaging:** a release keystore, an x86_64 Android target, and a universal macOS binary.
+6. **Packaging:** a real release keystore (CI now signs with the debug key kept in the `ANDROID_KEYSTORE_BASE64` secret), an x86_64 Android target, and a universal macOS binary.
 7. **Robustness:** resume interrupted transfers, show 0-byte files in send progress (no progress callback fires for them),
    and add integration tests for `core` (loopback send/receive, hash mismatch, name sanitizing; only the last exists).
 8. **Browsing follow-ups:** an owner-side switch to turn sharing of the save folder off (now every favorite that has added you can read it),

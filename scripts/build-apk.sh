@@ -9,6 +9,11 @@ if [[ -z "${ANDROID_NDK_ROOT:-}" ]]; then
 fi
 export ANDROID_NDK_ROOT
 
+# CI passes the signing key as base64 in ANDROID_KEYSTORE_BASE64 (a repository secret), so every build carries the same signature
+# and an installed AirLynx can be updated in place. Without it (local build, pull request from a fork) a key is created below.
+if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && ! -f android-debug.keystore ]]; then
+    printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android-debug.keystore
+fi
 if [[ ! -f android-debug.keystore ]]; then
     keytool -genkeypair -keystore android-debug.keystore -storepass android -keypass android \
         -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AirLynx Debug"

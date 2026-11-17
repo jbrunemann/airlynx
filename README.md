@@ -62,10 +62,14 @@ which AirLynx does not (yet), and it is more mature. AirLynx also does not authe
 
 ## Install
 
-AirLynx is built from source for now. The only prebuilt files are the Linux builds from GitHub Actions.
-You need [Rust](https://rustup.rs) 1.95 or newer.
+GitHub Actions builds every platform on each push to `main`. Open the latest run under the **Actions** tab and download the
+artifact: `airlynx-macos-arm64`, `airlynx-android` (both APKs) or `airlynx-linux-<arch>`. These are test builds, not
+releases. To build it yourself you need [Rust](https://rustup.rs) 1.95 or newer.
 
 ### macOS
+
+Unzip the artifact (Apple silicon) and drag `AirLynx.app` to Applications. The app is only ad-hoc signed, so the first
+time, right-click it and choose **Open**. To build it yourself:
 
 ```sh
 git clone https://github.com/jbrunemann/airlynx.git && cd airlynx
@@ -77,8 +81,10 @@ AirLynx cannot find your other devices.
 
 ### Android and Android TV
 
-Needs Android 11 or newer to run. Building needs the Android SDK and NDK
-(see [the developer guide](docs/DEVELOPING.md#toolchain-and-environment)).
+Needs Android 11 or newer. Install `AirLynx.apk` from the artifact (or `AirLynx-armv7.apk` on a 32-bit TV). A newer build installs over an older one and keeps
+your favorites, as long as both are signed with the same key (all CI builds are).
+
+To build it yourself you need the Android SDK and NDK (see [the developer guide](docs/DEVELOPING.md#toolchain-and-environment)):
 
 ```sh
 ./scripts/build-apk.sh --install      # builds the APKs and installs the arm64 one over adb
@@ -96,7 +102,7 @@ computer: `adb shell appops set dev.airlynx.app MANAGE_EXTERNAL_STORAGE allow`.
 
 ### Linux
 
-Download the `airlynx-linux-x86_64` or `airlynx-linux-aarch64` artifact from a GitHub Actions run, or build it
+Download the `airlynx-linux-x86_64` or `airlynx-linux-aarch64` artifact, or build it
 yourself (`./scripts/bundle-linux.sh`, or `./scripts/build-linux-docker.sh` from a Mac). Then:
 
 ```sh
